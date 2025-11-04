@@ -31,6 +31,34 @@ def setup_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
+def get_chrome_version(chrome_bin: str) -> str:
+    """Get Chrome version from the binary."""
+    try:
+        import subprocess
+        result = subprocess.run([chrome_bin, "--version"], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            version_str = result.stdout.strip()
+            logging.info(f"Chrome version output: {version_str}")
+            # Extract version number (e.g., "Chromium 144.0.7508.0" -> "144.0.7508.0")
+            import re
+            # Try full version first (e.g., 144.0.7508.0)
+            match = re.search(r'(\d+\.\d+\.\d+\.\d+)', version_str)
+            if match:
+                full_version = match.group(1)
+                logging.info(f"Detected full Chrome version: {full_version}")
+                return full_version
+            # Try major.minor (e.g., 144.0)
+            match = re.search(r'(\d+\.\d+)', version_str)
+            if match:
+                major_minor = match.group(1)
+                logging.info(f"Detected Chrome version (major.minor): {major_minor}")
+                return major_minor
+        logging.warning(f"Could not parse Chrome version from: {result.stdout}")
+    except Exception as e:
+        logging.warning(f"Failed to get Chrome version: {e}")
+    return None
+
+
 def create_driver() -> webdriver.Chrome:
     try:
         logging.info("Creating Chrome driver...")
@@ -48,18 +76,46 @@ def create_driver() -> webdriver.Chrome:
         if chrome_bin:
             chrome_options.binary_location = chrome_bin
             logging.info(f"Using Chrome binary: {chrome_bin}")
+            
+            # Get Chrome version to match ChromeDriver
+            chrome_version = get_chrome_version(chrome_bin)
+            if chrome_version:
+                logging.info(f"Detected Chrome version: {chrome_version}")
         else:
             logging.info("CHROME_BIN not set, using default Chrome")
+            chrome_version = None
         
-        # Install ChromeDriver
+        # Install ChromeDriver - try to match Chrome version
         logging.info("Installing ChromeDriver...")
+        driver_path = None
         try:
-            driver_path = ChromeDriverManager().install()
-            logging.info(f"ChromeDriver installed at: {driver_path}")
+            if chrome_version:
+                # Extract major version number for ChromeDriverManager
+                major_version = chrome_version.split('.')[0] if '.' in chrome_version else chrome_version
+                logging.info(f"Attempting to get ChromeDriver for Chrome major version {major_version}...")
+                try:
+                    # Try with major version
+                    driver_path = ChromeDriverManager(version=major_version).install()
+                    logging.info(f"ChromeDriver installed at: {driver_path}")
+                except Exception as e1:
+                    logging.warning(f"ChromeDriverManager with major version {major_version} failed: {e1}")
+                    # Try with full version
+                    try:
+                        driver_path = ChromeDriverManager(version=chrome_version).install()
+                        logging.info(f"ChromeDriver installed at: {driver_path}")
+                    except Exception as e2:
+                        logging.warning(f"ChromeDriverManager with full version {chrome_version} failed: {e2}")
+                        raise e1  # Re-raise original error
+            
+            if not driver_path:
+                # Fallback: Let ChromeDriverManager auto-detect (should work with latest)
+                logging.info("Using ChromeDriverManager auto-detection...")
+                driver_path = ChromeDriverManager().install()
+                logging.info(f"ChromeDriver installed at: {driver_path}")
+                
         except Exception as e:
             logging.error(f"ChromeDriverManager failed: {e}")
-            # Try to use system chromedriver if available
-            logging.info("Trying to use system chromedriver...")
+            logging.info("Trying to use system chromedriver if available...")
             driver_path = None
         
         service = Service(driver_path) if driver_path else Service()
