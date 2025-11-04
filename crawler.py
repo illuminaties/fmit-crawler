@@ -35,6 +35,12 @@ def create_driver() -> webdriver.Chrome:
     chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument("--disable-extensions")
     chrome_options.add_argument("--blink-settings=imagesEnabled=false")
+    
+    # Use CHROME_BIN if provided (e.g., in GitHub Actions)
+    chrome_bin = os.getenv("CHROME_BIN")
+    if chrome_bin:
+        chrome_options.binary_location = chrome_bin
+    
     service = Service(ChromeDriverManager().install())
     return webdriver.Chrome(service=service, options=chrome_options)
 
