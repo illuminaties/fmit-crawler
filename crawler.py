@@ -85,40 +85,86 @@ def create_driver() -> webdriver.Chrome:
             logging.info("CHROME_BIN not set, using default Chrome")
             chrome_version = None
         
-        # Install ChromeDriver - try to match Chrome version
+        # Install ChromeDriver - ChromeDriverManager should auto-detect Chrome version
         logging.info("Installing ChromeDriver...")
         driver_path = None
         try:
-            if chrome_version:
-                # Extract major version number for ChromeDriverManager
-                major_version = chrome_version.split('.')[0] if '.' in chrome_version else chrome_version
-                logging.info(f"Attempting to get ChromeDriver for Chrome major version {major_version}...")
-                try:
-                    # Try with major version
-                    driver_path = ChromeDriverManager(version=major_version).install()
-                    logging.info(f"ChromeDriver installed at: {driver_path}")
-                except Exception as e1:
-                    logging.warning(f"ChromeDriverManager with major version {major_version} failed: {e1}")
-                    # Try with full version
-                    try:
-                        driver_path = ChromeDriverManager(version=chrome_version).install()
-                        logging.info(f"ChromeDriver installed at: {driver_path}")
-                    except Exception as e2:
-                        logging.warning(f"ChromeDriverManager with full version {chrome_version} failed: {e2}")
-                        raise e1  # Re-raise original error
+            # ChromeDriverManager should auto-detect Chrome version when binary_location is set
+            # But we need to clear cache first to get latest version
+            logging.info("Clearing ChromeDriverManager cache to get latest version...")
+            try:
+                import shutil
+                cache_dir = os.path.expanduser("~/.wdm")
+                if os.path.exists(cache_dir):
+                    shutil.rmtree(cache_dir)
+                    logging.info("Cleared ChromeDriverManager cache")
+            except Exception as cache_error:
+                logging.warning(f"Could not clear cache: {cache_error}")
             
-            if not driver_path:
-                # Fallback: Let ChromeDriverManager auto-detect (should work with latest)
-                logging.info("Using ChromeDriverManager auto-detection...")
-                driver_path = ChromeDriverManager().install()
-                logging.info(f"ChromeDriver installed at: {driver_path}")
+            # Use ChromeDriverManager - it should auto-detect Chrome version
+            logging.info("Downloading ChromeDriver (this may take a moment)...")
+            driver_manager = ChromeDriverManager()
+            driver_path = driver_manager.install()
+            logging.info(f"ChromeDriver installed at: {driver_path}")
                 
         except Exception as e:
-            logging.error(f"ChromeDriverManager failed: {e}")
-            logging.info("Trying to use system chromedriver if available...")
-            driver_path = None
+            logging.error(f"ChromeDriverManager failed: {e}", exc_info=True)
+            # Try manual download for Chrome 144
+            logging.info("Attempting manual ChromeDriver download for Chrome 144...")
+            try:
+                import urllib.request
+                import zipfile
+                
+                # Use a persistent directory for ChromeDriver
+                chromedriver_dir = os.path.expanduser("~/.wdm/drivers/chromedriver/linux64/144.0.7507.0")
+                os.makedirs(chromedriver_dir, exist_ok=True)
+                chromedriver_bin = os.path.join(chromedriver_dir, "chromedriver")
+                
+                # Only download if not already present
+                if not os.path.exists(chromedriver_bin):
+                    # Download ChromeDriver 144.0.7507.0 (as recommended in the warning)
+                    chromedriver_url = "https://storage.googleapis.com/chrome-for-testing-public/144.0.7507.0/linux64/chromedriver-linux64.zip"
+                    logging.info(f"Downloading from: {chromedriver_url}")
+                    
+                    zip_path = os.path.join(chromedriver_dir, "chromedriver.zip")
+                    urllib.request.urlretrieve(chromedriver_url, zip_path)
+                    
+                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                        zip_ref.extractall(chromedriver_dir)
+                    
+                    # Remove zip file
+                    os.remove(zip_path)
+                    
+                    # Find chromedriver binary (might be in subdirectory)
+                    possible_paths = [
+                        os.path.join(chromedriver_dir, "chromedriver-linux64", "chromedriver"),
+                        os.path.join(chromedriver_dir, "chromedriver"),
+                        chromedriver_bin
+                    ]
+                    
+                    for path in possible_paths:
+                        if os.path.exists(path):
+                            if path != chromedriver_bin:
+                                # Move to expected location
+                                import shutil
+                                shutil.move(path, chromedriver_bin)
+                            break
+                    
+                    if not os.path.exists(chromedriver_bin):
+                        raise Exception("ChromeDriver binary not found in zip")
+                
+                # Make executable
+                os.chmod(chromedriver_bin, 0o755)
+                driver_path = chromedriver_bin
+                logging.info(f"Manually downloaded ChromeDriver at: {driver_path}")
+            except Exception as manual_error:
+                logging.error(f"Manual download also failed: {manual_error}")
+                raise Exception(f"Could not install ChromeDriver. ChromeDriverManager error: {e}, Manual download error: {manual_error}")
         
-        service = Service(driver_path) if driver_path else Service()
+        if not driver_path:
+            raise Exception("Failed to get ChromeDriver path")
+        
+        service = Service(driver_path)
         logging.info("Starting Chrome browser...")
         driver = webdriver.Chrome(service=service, options=chrome_options)
         logging.info("Chrome driver created successfully")
