@@ -13,7 +13,9 @@ from typing import Tuple, List, Dict, Set
 import pandas as pd
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import NoSuchElementException
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
@@ -199,6 +201,8 @@ def create_driver() -> webdriver.Chrome:
     chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument("--disable-extensions")
     chrome_options.add_argument("--blink-settings=imagesEnabled=false")
+    # Add user agent to avoid bot detection
+    chrome_options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36")
     
     # Get Chrome version using the same binary we'll use for Selenium
     chromedriver_path = None
@@ -304,21 +308,60 @@ def append_to_parquet(rows: List[Dict[str, str]]) -> None:
 
 
 def extract_page_links(driver: webdriver.Chrome, url: str, max_retries: int = 5) -> Tuple[List[str], webdriver.Chrome]:
-    for _ in range(max_retries):
+    for attempt in range(max_retries):
         try:
             driver.get(url)
-            time.sleep(3)
-            items = driver.find_element(By.CLASS_NAME, "dictionary-items")
+            
+            # Wait for page to load - wait for body or document ready
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            
+            # Wait for the dictionary-items element to appear (with longer timeout)
+            try:
+                items = WebDriverWait(driver, 15).until(
+                    EC.presence_of_element_located((By.CLASS_NAME, "dictionary-items"))
+                )
+            except TimeoutException:
+                # If element not found, log page source snippet for debugging
+                page_source_preview = driver.page_source[:500] if driver.page_source else "No page source"
+                logging.warning(f"Element '.dictionary-items' not found on {url}. Page source preview: {page_source_preview}...")
+                # Try to find alternative selectors
+                alternative_selectors = [
+                    (By.CLASS_NAME, "dictionary"),
+                    (By.CSS_SELECTOR, "[class*='dictionary']"),
+                    (By.CSS_SELECTOR, "[class*='item']"),
+                ]
+                for selector_type, selector_value in alternative_selectors:
+                    try:
+                        elements = driver.find_elements(selector_type, selector_value)
+                        if elements:
+                            logging.info(f"Found {len(elements)} elements with selector {selector_type}:{selector_value}")
+                    except:
+                        pass
+                raise
+            
             links = items.find_elements(By.XPATH, './/li[@class="item"]/a[@href]')
             hrefs: List[str] = []
             for link in links:
                 href = link.get_attribute("href")
                 if href and "fmit.vn" in href and ("/glossary/" in href or "/tu-dien-quan-ly/" in href):
                     hrefs.append(href)
+            
+            if hrefs:
+                logging.info(f"Found {len(hrefs)} links on {url}")
+            else:
+                logging.warning(f"No links found in dictionary-items on {url}")
+            
             return list(set(hrefs)), driver
-        except Exception as e:
-            logging.warning(f"Page error {url}: {e}. Retry in 10s...")
+        except TimeoutException as e:
+            logging.warning(f"Page timeout {url} (attempt {attempt + 1}/{max_retries}): {e}. Retry in 10s...")
             time.sleep(10)
+        except Exception as e:
+            logging.warning(f"Page error {url} (attempt {attempt + 1}/{max_retries}): {e}. Retry in 10s...")
+            time.sleep(10)
+
+    logging.error(f"Failed to extract links from {url} after {max_retries} attempts")
     return [], driver
 
 
