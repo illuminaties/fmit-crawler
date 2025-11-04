@@ -152,13 +152,45 @@ def download_chromedriver_for_version(chrome_version: str) -> str:
 
 
 def create_driver() -> webdriver.Chrome:
-    chrome_options = Options()
+    logging.info("Creating Chrome driver...")
     
-    # Set Chrome binary if provided
+    # Get Chrome binary path - prioritize CHROME_BIN env var
     chrome_bin = os.getenv("CHROME_BIN")
-    if chrome_bin:
-        chrome_options.binary_location = chrome_bin
-        logging.info(f"Using Chrome binary: {chrome_bin}")
+    if not chrome_bin:
+        # Fallback: try to find Chrome in GitHub Actions location
+        if os.path.exists("/opt/hostedtoolcache/setup-chrome/chromium"):
+            chrome_bin_pattern = "/opt/hostedtoolcache/setup-chrome/chromium/*/x64/chrome"
+            matches = glob.glob(chrome_bin_pattern)
+            if matches:
+                chrome_bin = matches[0]
+        else:
+            chrome_bin = "google-chrome"
+    
+    # Verify Chrome binary exists
+    if not os.path.exists(chrome_bin):
+        raise FileNotFoundError(f"Chrome binary not found at: {chrome_bin}")
+    
+    # Verify it's executable
+    if not os.access(chrome_bin, os.X_OK):
+        raise PermissionError(f"Chrome binary is not executable: {chrome_bin}")
+    
+    logging.info(f"Using Chrome binary: {chrome_bin}")
+    
+    # Verify the version of this binary
+    try:
+        result = subprocess.run(
+            [chrome_bin, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        logging.info(f"Chrome binary version check: {result.stdout.strip()}")
+    except Exception as e:
+        logging.warning(f"Could not verify Chrome binary version: {e}")
+    
+    # Set Chrome binary location BEFORE getting version (so we use the same binary)
+    chrome_options = Options()
+    chrome_options.binary_location = chrome_bin
     
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
@@ -168,13 +200,23 @@ def create_driver() -> webdriver.Chrome:
     chrome_options.add_argument("--disable-extensions")
     chrome_options.add_argument("--blink-settings=imagesEnabled=false")
     
-    # Try to get Chrome version and download matching ChromeDriver
+    # Get Chrome version using the same binary we'll use for Selenium
     chromedriver_path = None
     try:
+        # Temporarily set CHROME_BIN so get_chrome_version uses the correct binary
+        original_chrome_bin = os.getenv("CHROME_BIN")
+        os.environ["CHROME_BIN"] = chrome_bin
+        
         chrome_version = get_chrome_version()
         if chrome_version:
             logging.info(f"Installing ChromeDriver for Chrome {chrome_version}...")
             chromedriver_path = download_chromedriver_for_version(chrome_version)
+        
+        # Restore original env var
+        if original_chrome_bin:
+            os.environ["CHROME_BIN"] = original_chrome_bin
+        elif "CHROME_BIN" in os.environ:
+            del os.environ["CHROME_BIN"]
     except Exception as e:
         logging.warning(f"Failed to get ChromeDriver for specific version: {e}")
         logging.info("Falling back to webdriver-manager...")
@@ -190,9 +232,18 @@ def create_driver() -> webdriver.Chrome:
     
     service = Service(chromedriver_path)
     logging.info("Starting Chrome browser...")
-    driver = webdriver.Chrome(service=service, options=chrome_options)
-    logging.info("Chrome driver created successfully")
-    return driver
+    logging.info(f"ChromeDriver path: {chromedriver_path}")
+    logging.info(f"Chrome binary path: {chrome_bin}")
+    
+    try:
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        logging.info("Chrome driver created successfully")
+        return driver
+    except Exception as e:
+        logging.error(f"Failed to create Chrome driver: {e}")
+        logging.error(f"ChromeDriver path: {chromedriver_path}")
+        logging.error(f"Chrome binary path: {chrome_bin}")
+        raise
 
 
 def save_page_checkpoint(page: int) -> None:
