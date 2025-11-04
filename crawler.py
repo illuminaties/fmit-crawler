@@ -1,8 +1,13 @@
 import os
-import sys
 import time
 import json
 import logging
+import subprocess
+import re
+import glob
+import requests
+import zipfile
+from pathlib import Path
 from typing import Tuple, List, Dict, Set
 
 import pandas as pd
@@ -22,156 +27,172 @@ PAGE_CHECKPOINT = os.path.join(DATA_DIR, "page_checkpoint.json")
 BASE_URL = "https://fmit.vn/en/glossary"
 MAX_PAGES = 6729
 
-# Timeout settings (5.5 hours = 19800 seconds) - leave buffer for GitHub Actions 6-hour limit
-MAX_RUNTIME_SECONDS = int(os.getenv("MAX_RUNTIME_SECONDS", "19800"))  # 5.5 hours default
-MAX_URLS_PER_RUN = int(os.getenv("MAX_URLS_PER_RUN", "500"))  # Reduced from 1500
-
 
 def setup_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-def get_chrome_version(chrome_bin: str) -> str:
-    """Get Chrome version from the binary."""
+def get_chrome_version() -> str:
+    """Get Chrome version from binary."""
+    chrome_bin = os.getenv("CHROME_BIN")
+    if not chrome_bin:
+        chrome_bin = "google-chrome"
+        if os.path.exists("/opt/hostedtoolcache/setup-chrome/chromium"):
+            # GitHub Actions Chrome
+            chrome_bin_pattern = "/opt/hostedtoolcache/setup-chrome/chromium/*/x64/chrome"
+            matches = glob.glob(chrome_bin_pattern)
+            if matches:
+                chrome_bin = matches[0]
+    
     try:
-        import subprocess
-        result = subprocess.run([chrome_bin, "--version"], capture_output=True, text=True, timeout=10)
-        if result.returncode == 0:
-            version_str = result.stdout.strip()
-            logging.info(f"Chrome version output: {version_str}")
-            # Extract version number (e.g., "Chromium 144.0.7508.0" -> "144.0.7508.0")
-            import re
-            # Try full version first (e.g., 144.0.7508.0)
-            match = re.search(r'(\d+\.\d+\.\d+\.\d+)', version_str)
-            if match:
-                full_version = match.group(1)
-                logging.info(f"Detected full Chrome version: {full_version}")
-                return full_version
-            # Try major.minor (e.g., 144.0)
-            match = re.search(r'(\d+\.\d+)', version_str)
-            if match:
-                major_minor = match.group(1)
-                logging.info(f"Detected Chrome version (major.minor): {major_minor}")
-                return major_minor
-        logging.warning(f"Could not parse Chrome version from: {result.stdout}")
+        result = subprocess.run(
+            [chrome_bin, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        version_output = result.stdout.strip()
+        logging.info(f"Chrome version output: {version_output}")
+        
+        # Extract version number (e.g., "Chromium 144.0.7508.0" -> "144.0.7508.0")
+        match = re.search(r'(\d+\.\d+\.\d+\.\d+)', version_output)
+        if match:
+            full_version = match.group(1)
+            logging.info(f"Detected full Chrome version: {full_version}")
+            # Get major version (e.g., "144.0.7508.0" -> "144")
+            major_version = full_version.split('.')[0]
+            logging.info(f"Detected Chrome version: {major_version}")
+            return major_version
+        return None
     except Exception as e:
-        logging.warning(f"Failed to get Chrome version: {e}")
-    return None
+        logging.warning(f"Could not detect Chrome version: {e}")
+        return None
+
+
+def download_chromedriver_for_version(chrome_version: str) -> str:
+    """Download ChromeDriver for a specific Chrome version from Chrome for Testing."""
+    try:
+        # Get available ChromeDriver versions
+        versions_url = "https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json"
+        response = requests.get(versions_url, timeout=30)
+        response.raise_for_status()
+        versions_data = response.json()
+        
+        # Find matching ChromeDriver version
+        target_version = None
+        for version_info in reversed(versions_data["versions"]):
+            version_str = version_info["version"]
+            if version_str.startswith(f"{chrome_version}."):
+                target_version = version_str
+                break
+        
+        if not target_version:
+            logging.warning(f"No ChromeDriver found for Chrome {chrome_version}, trying latest")
+            # Try to get the latest version for this major version
+            for version_info in reversed(versions_data["versions"]):
+                version_str = version_info["version"]
+                if version_str.split('.')[0] == chrome_version:
+                    target_version = version_str
+                    break
+        
+        if not target_version:
+            raise Exception(f"No ChromeDriver found for Chrome version {chrome_version}")
+        
+        logging.info(f"Found ChromeDriver version: {target_version}")
+        
+        # Get download URL for Linux
+        download_url = None
+        for version_info in versions_data["versions"]:
+            if version_info["version"] == target_version:
+                downloads = version_info.get("downloads", {})
+                chromedriver = downloads.get("chromedriver", [])
+                for item in chromedriver:
+                    if item["platform"] == "linux64":
+                        download_url = item["url"]
+                        break
+                break
+        
+        if not download_url:
+            raise Exception(f"No Linux64 ChromeDriver download found for version {target_version}")
+        
+        # Download and extract
+        logging.info(f"Downloading ChromeDriver from {download_url}")
+        cache_dir = Path.home() / ".wdm" / "drivers" / "chromedriver" / "linux64" / target_version
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        zip_path = cache_dir / "chromedriver-linux64.zip"
+        response = requests.get(download_url, timeout=120)
+        response.raise_for_status()
+        with open(zip_path, "wb") as f:
+            f.write(response.content)
+        
+        # Extract
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            zip_ref.extractall(cache_dir)
+        
+        # Find chromedriver executable (it might be in a subdirectory)
+        chromedriver_path = None
+        for root, dirs, files in os.walk(cache_dir):
+            if "chromedriver" in files:
+                chromedriver_path = Path(root) / "chromedriver"
+                break
+        
+        if not chromedriver_path or not chromedriver_path.exists():
+            raise Exception(f"ChromeDriver executable not found after extraction in {cache_dir}")
+        
+        # Make executable
+        os.chmod(chromedriver_path, 0o755)
+        
+        logging.info(f"ChromeDriver installed at: {chromedriver_path}")
+        return str(chromedriver_path)
+        
+    except Exception as e:
+        logging.error(f"Failed to download ChromeDriver for version {chrome_version}: {e}")
+        raise
 
 
 def create_driver() -> webdriver.Chrome:
+    chrome_options = Options()
+    
+    # Set Chrome binary if provided
+    chrome_bin = os.getenv("CHROME_BIN")
+    if chrome_bin:
+        chrome_options.binary_location = chrome_bin
+        logging.info(f"Using Chrome binary: {chrome_bin}")
+    
+    chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--blink-settings=imagesEnabled=false")
+    
+    # Try to get Chrome version and download matching ChromeDriver
+    chromedriver_path = None
     try:
-        logging.info("Creating Chrome driver...")
-        chrome_options = Options()
-        chrome_options.add_argument("--headless=new")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--window-size=1920,1080")
-        chrome_options.add_argument("--disable-extensions")
-        chrome_options.add_argument("--blink-settings=imagesEnabled=false")
-        
-        # Use CHROME_BIN if provided (e.g., in GitHub Actions)
-        chrome_bin = os.getenv("CHROME_BIN")
-        if chrome_bin:
-            chrome_options.binary_location = chrome_bin
-            logging.info(f"Using Chrome binary: {chrome_bin}")
-            
-            # Get Chrome version to match ChromeDriver
-            chrome_version = get_chrome_version(chrome_bin)
-            if chrome_version:
-                logging.info(f"Detected Chrome version: {chrome_version}")
-        else:
-            logging.info("CHROME_BIN not set, using default Chrome")
-            chrome_version = None
-        
-        # Install ChromeDriver - ChromeDriverManager should auto-detect Chrome version
-        logging.info("Installing ChromeDriver...")
-        driver_path = None
-        try:
-            # ChromeDriverManager should auto-detect Chrome version when binary_location is set
-            # But we need to clear cache first to get latest version
-            logging.info("Clearing ChromeDriverManager cache to get latest version...")
-            try:
-                import shutil
-                cache_dir = os.path.expanduser("~/.wdm")
-                if os.path.exists(cache_dir):
-                    shutil.rmtree(cache_dir)
-                    logging.info("Cleared ChromeDriverManager cache")
-            except Exception as cache_error:
-                logging.warning(f"Could not clear cache: {cache_error}")
-            
-            # Use ChromeDriverManager - it should auto-detect Chrome version
-            logging.info("Downloading ChromeDriver (this may take a moment)...")
-            driver_manager = ChromeDriverManager()
-            driver_path = driver_manager.install()
-            logging.info(f"ChromeDriver installed at: {driver_path}")
-                
-        except Exception as e:
-            logging.error(f"ChromeDriverManager failed: {e}", exc_info=True)
-            # Try manual download for Chrome 144
-            logging.info("Attempting manual ChromeDriver download for Chrome 144...")
-            try:
-                import urllib.request
-                import zipfile
-                
-                # Use a persistent directory for ChromeDriver
-                chromedriver_dir = os.path.expanduser("~/.wdm/drivers/chromedriver/linux64/144.0.7507.0")
-                os.makedirs(chromedriver_dir, exist_ok=True)
-                chromedriver_bin = os.path.join(chromedriver_dir, "chromedriver")
-                
-                # Only download if not already present
-                if not os.path.exists(chromedriver_bin):
-                    # Download ChromeDriver 144.0.7507.0 (as recommended in the warning)
-                    chromedriver_url = "https://storage.googleapis.com/chrome-for-testing-public/144.0.7507.0/linux64/chromedriver-linux64.zip"
-                    logging.info(f"Downloading from: {chromedriver_url}")
-                    
-                    zip_path = os.path.join(chromedriver_dir, "chromedriver.zip")
-                    urllib.request.urlretrieve(chromedriver_url, zip_path)
-                    
-                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                        zip_ref.extractall(chromedriver_dir)
-                    
-                    # Remove zip file
-                    os.remove(zip_path)
-                    
-                    # Find chromedriver binary (might be in subdirectory)
-                    possible_paths = [
-                        os.path.join(chromedriver_dir, "chromedriver-linux64", "chromedriver"),
-                        os.path.join(chromedriver_dir, "chromedriver"),
-                        chromedriver_bin
-                    ]
-                    
-                    for path in possible_paths:
-                        if os.path.exists(path):
-                            if path != chromedriver_bin:
-                                # Move to expected location
-                                import shutil
-                                shutil.move(path, chromedriver_bin)
-                            break
-                    
-                    if not os.path.exists(chromedriver_bin):
-                        raise Exception("ChromeDriver binary not found in zip")
-                
-                # Make executable
-                os.chmod(chromedriver_bin, 0o755)
-                driver_path = chromedriver_bin
-                logging.info(f"Manually downloaded ChromeDriver at: {driver_path}")
-            except Exception as manual_error:
-                logging.error(f"Manual download also failed: {manual_error}")
-                raise Exception(f"Could not install ChromeDriver. ChromeDriverManager error: {e}, Manual download error: {manual_error}")
-        
-        if not driver_path:
-            raise Exception("Failed to get ChromeDriver path")
-        
-        service = Service(driver_path)
-        logging.info("Starting Chrome browser...")
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        logging.info("Chrome driver created successfully")
-        return driver
+        chrome_version = get_chrome_version()
+        if chrome_version:
+            logging.info(f"Installing ChromeDriver for Chrome {chrome_version}...")
+            chromedriver_path = download_chromedriver_for_version(chrome_version)
     except Exception as e:
-        logging.error(f"Failed to create Chrome driver: {e}", exc_info=True)
-        raise
+        logging.warning(f"Failed to get ChromeDriver for specific version: {e}")
+        logging.info("Falling back to webdriver-manager...")
+    
+    # Fallback to webdriver-manager if Chrome for Testing fails
+    if not chromedriver_path:
+        try:
+            logging.info("Installing ChromeDriver via webdriver-manager...")
+            chromedriver_path = ChromeDriverManager().install()
+        except Exception as e:
+            logging.error(f"Failed to install ChromeDriver: {e}")
+            raise
+    
+    service = Service(chromedriver_path)
+    logging.info("Starting Chrome browser...")
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    logging.info("Chrome driver created successfully")
+    return driver
 
 
 def save_page_checkpoint(page: int) -> None:
@@ -231,11 +252,11 @@ def append_to_parquet(rows: List[Dict[str, str]]) -> None:
     write_parquet_df(df)
 
 
-def extract_page_links(driver: webdriver.Chrome, url: str, max_retries: int = 3) -> Tuple[List[str], webdriver.Chrome]:
+def extract_page_links(driver: webdriver.Chrome, url: str, max_retries: int = 5) -> Tuple[List[str], webdriver.Chrome]:
     for _ in range(max_retries):
         try:
             driver.get(url)
-            time.sleep(2)  # Reduced from 3
+            time.sleep(3)
             items = driver.find_element(By.CLASS_NAME, "dictionary-items")
             links = items.find_elements(By.XPATH, './/li[@class="item"]/a[@href]')
             hrefs: List[str] = []
@@ -245,16 +266,16 @@ def extract_page_links(driver: webdriver.Chrome, url: str, max_retries: int = 3)
                     hrefs.append(href)
             return list(set(hrefs)), driver
         except Exception as e:
-            logging.warning(f"Page error {url}: {e}. Retry in 5s...")
-            time.sleep(5)  # Reduced from 10
+            logging.warning(f"Page error {url}: {e}. Retry in 10s...")
+            time.sleep(10)
     return [], driver
 
 
-def extract_url_data(driver: webdriver.Chrome, url: str, max_retries: int = 3) -> Tuple[Dict[str, str], webdriver.Chrome]:
+def extract_url_data(driver: webdriver.Chrome, url: str, max_retries: int = 5) -> Tuple[Dict[str, str], webdriver.Chrome]:
     for _ in range(max_retries):
         try:
             driver.get(url)
-            time.sleep(1.5)  # Reduced from 2
+            time.sleep(2)
             h1 = h2 = content = ""
             try:
                 h1_el = driver.find_element(By.CSS_SELECTOR, "h1.dictionary-detail-title")
@@ -273,110 +294,58 @@ def extract_url_data(driver: webdriver.Chrome, url: str, max_retries: int = 3) -
                 pass
             return {"url": url, "h1": h1, "h2": h2, "content": content}, driver
         except Exception as e:
-            logging.warning(f"URL error {url}: {e}. Retry in 5s...")
-            time.sleep(5)  # Reduced from 10
+            logging.warning(f"URL error {url}: {e}. Retry in 10s...")
+            time.sleep(10)
     return {"url": url, "h1": "", "h2": "", "content": ""}, driver
 
 
 def run_once() -> None:
     setup_logging()
-    start_time = time.time()
-    driver = None
+    logging.info("START CRAWL (GitHub Actions, Parquet)")
+    processed = load_processed_urls()
+    driver = create_driver()
+
+    start_page = load_page_checkpoint() + 1
+    current_page = max(start_page, 1)
+    all_urls: Set[str] = set()
+
+    logging.info(f"Collect URLs from page {current_page} to {MAX_PAGES}")
+    while current_page <= MAX_PAGES:
+        url = BASE_URL if current_page == 1 else f"{BASE_URL}?page={current_page}"
+        hrefs, driver = extract_page_links(driver, url)
+        new_hrefs = [h for h in hrefs if h not in processed and h not in all_urls]
+        all_urls.update(new_hrefs)
+        if new_hrefs or hrefs:
+            save_page_checkpoint(current_page)
+        logging.info(f"Page {current_page}: +{len(new_hrefs)} new links (total: {len(all_urls)})")
+        current_page += 1
+        time.sleep(2)
+        if len(all_urls) >= 1500:
+            break
+
+    logging.info(f"Total new URLs this run: {len(all_urls)}")
+
+    batch: List[Dict[str, str]] = []
+    for idx, url in enumerate(all_urls, 1):
+        data, driver = extract_url_data(driver, url)
+        batch.append(data)
+        if len(batch) >= 50:
+            append_to_parquet(batch)
+            batch = []
+            logging.info(f"Saved {idx}/{len(all_urls)} URLs")
+        time.sleep(1.5)
+
+    if batch:
+        append_to_parquet(batch)
+
     try:
-        logging.info("=" * 60)
-        logging.info("START CRAWL (GitHub Actions, Parquet)")
-        logging.info("=" * 60)
-        logging.info(f"Python version: {sys.version}")
-        logging.info(f"Max runtime: {MAX_RUNTIME_SECONDS}s ({MAX_RUNTIME_SECONDS/3600:.1f}h)")
-        logging.info(f"Max URLs per run: {MAX_URLS_PER_RUN}")
-        logging.info(f"DATA_DIR: {DATA_DIR}")
-        logging.info(f"CHROME_BIN: {os.getenv('CHROME_BIN', 'Not set')}")
-        
-        logging.info("Loading processed URLs...")
-        processed = load_processed_urls()
-        logging.info(f"Found {len(processed)} already processed URLs")
-        
-        logging.info("Creating Chrome driver...")
-        driver = create_driver()
-
-        def check_timeout() -> bool:
-            elapsed = time.time() - start_time
-            if elapsed >= MAX_RUNTIME_SECONDS:
-                logging.warning(f"Timeout reached ({elapsed:.0f}s). Stopping gracefully.")
-                return True
-            return False
-
-        start_page = load_page_checkpoint() + 1
-        current_page = max(start_page, 1)
-        all_urls: Set[str] = set()
-
-        logging.info(f"Collect URLs from page {current_page} to {MAX_PAGES}")
-        while current_page <= MAX_PAGES:
-            if check_timeout():
-                break
-            
-            url = BASE_URL if current_page == 1 else f"{BASE_URL}?page={current_page}"
-            hrefs, driver = extract_page_links(driver, url)
-            new_hrefs = [h for h in hrefs if h not in processed and h not in all_urls]
-            all_urls.update(new_hrefs)
-            if new_hrefs or hrefs:
-                save_page_checkpoint(current_page)
-            
-            elapsed = time.time() - start_time
-            logging.info(f"Page {current_page}: +{len(new_hrefs)} new links (total: {len(all_urls)}), elapsed: {elapsed/60:.1f}m")
-            
-            current_page += 1
-            time.sleep(1.5)  # Reduced from 2
-            if len(all_urls) >= MAX_URLS_PER_RUN:
-                logging.info(f"Reached max URLs limit ({MAX_URLS_PER_RUN})")
-                break
-
-        logging.info(f"Total new URLs this run: {len(all_urls)}")
-
-        if all_urls and not check_timeout():
-            batch: List[Dict[str, str]] = []
-            for idx, url in enumerate(all_urls, 1):
-                if check_timeout():
-                    logging.warning(f"Timeout during URL processing. Processed {idx-1}/{len(all_urls)} URLs.")
-                    break
-                
-                data, driver = extract_url_data(driver, url)
-                batch.append(data)
-                
-                if len(batch) >= 50:
-                    append_to_parquet(batch)
-                    batch = []
-                    elapsed = time.time() - start_time
-                    remaining = len(all_urls) - idx
-                    eta_minutes = (elapsed / idx) * remaining / 60 if idx > 0 else 0
-                    logging.info(f"Saved {idx}/{len(all_urls)} URLs, elapsed: {elapsed/60:.1f}m, ETA: {eta_minutes:.1f}m")
-                
-                time.sleep(1)  # Reduced from 1.5
-
-            if batch:
-                append_to_parquet(batch)
-
-        total_time = time.time() - start_time
-        logging.info(f"DONE. Data saved in Parquet. Total time: {total_time/60:.1f}m ({total_time/3600:.2f}h). Can resume next run.")
-    finally:
-        if driver:
-            try:
-                driver.quit()
-                logging.info("Chrome driver closed")
-            except Exception as e:
-                logging.warning(f"Error closing driver: {e}")
+        driver.quit()
+    except Exception:
+        pass
+    logging.info("DONE. Data saved in Parquet and can resume next run.")
 
 
 if __name__ == "__main__":
-    import sys
-    try:
-        run_once()
-        sys.exit(0)
-    except KeyboardInterrupt:
-        logging.warning("Interrupted by user")
-        sys.exit(1)
-    except Exception as e:
-        logging.error(f"Fatal error: {e}", exc_info=True)
-        sys.exit(1)
+    run_once()
 
 

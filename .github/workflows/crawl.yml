@@ -11,7 +11,6 @@ permissions:
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 330  # 5.5 hours - safety timeout before GitHub's 6-hour limit
 
     steps:
       - name: Checkout
@@ -26,7 +25,6 @@ jobs:
           python-version: '3.11'
 
       - name: Setup Google Chrome
-        id: setup-chrome
         uses: browser-actions/setup-chrome@v1
 
       - name: Install dependencies
