@@ -73,7 +73,27 @@ def get_chrome_version() -> str:
 
 def download_chromedriver_for_version(chrome_version: str) -> str:
     """Download ChromeDriver for a specific Chrome version from Chrome for Testing."""
+    import platform
+    
     try:
+        # Detect platform
+        system = platform.system().lower()
+        if system == "darwin":
+            # macOS
+            if platform.machine().lower() in ["arm64", "aarch64"]:
+                platform_name = "mac-arm64"
+            else:
+                platform_name = "mac-x64"
+        elif system == "linux":
+            platform_name = "linux64"
+        elif system == "windows":
+            platform_name = "win64"
+        else:
+            # Default to linux64 for GitHub Actions
+            platform_name = "linux64"
+        
+        logging.info(f"Detected platform: {platform_name}")
+        
         # Get available ChromeDriver versions
         versions_url = "https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json"
         response = requests.get(versions_url, timeout=30)
@@ -102,27 +122,35 @@ def download_chromedriver_for_version(chrome_version: str) -> str:
         
         logging.info(f"Found ChromeDriver version: {target_version}")
         
-        # Get download URL for Linux
+        # Get download URL for the detected platform
         download_url = None
         for version_info in versions_data["versions"]:
             if version_info["version"] == target_version:
                 downloads = version_info.get("downloads", {})
                 chromedriver = downloads.get("chromedriver", [])
                 for item in chromedriver:
-                    if item["platform"] == "linux64":
+                    if item["platform"] == platform_name:
                         download_url = item["url"]
                         break
                 break
         
         if not download_url:
-            raise Exception(f"No Linux64 ChromeDriver download found for version {target_version}")
+            raise Exception(f"No {platform_name} ChromeDriver download found for version {target_version}")
         
         # Download and extract
         logging.info(f"Downloading ChromeDriver from {download_url}")
-        cache_dir = Path.home() / ".wdm" / "drivers" / "chromedriver" / "linux64" / target_version
+        cache_dir = Path.home() / ".wdm" / "drivers" / "chromedriver" / platform_name / target_version
         cache_dir.mkdir(parents=True, exist_ok=True)
         
-        zip_path = cache_dir / "chromedriver-linux64.zip"
+        # Determine zip filename based on platform
+        zip_filename = {
+            "linux64": "chromedriver-linux64.zip",
+            "mac-x64": "chromedriver-mac-x64.zip",
+            "mac-arm64": "chromedriver-mac-arm64.zip",
+            "win64": "chromedriver-win64.zip"
+        }.get(platform_name, "chromedriver.zip")
+        
+        zip_path = cache_dir / zip_filename
         response = requests.get(download_url, timeout=120)
         response.raise_for_status()
         with open(zip_path, "wb") as f:
@@ -134,16 +162,18 @@ def download_chromedriver_for_version(chrome_version: str) -> str:
         
         # Find chromedriver executable (it might be in a subdirectory)
         chromedriver_path = None
+        executable_name = "chromedriver.exe" if system == "windows" else "chromedriver"
         for root, dirs, files in os.walk(cache_dir):
-            if "chromedriver" in files:
-                chromedriver_path = Path(root) / "chromedriver"
+            if executable_name in files:
+                chromedriver_path = Path(root) / executable_name
                 break
         
         if not chromedriver_path or not chromedriver_path.exists():
             raise Exception(f"ChromeDriver executable not found after extraction in {cache_dir}")
         
-        # Make executable
-        os.chmod(chromedriver_path, 0o755)
+        # Make executable (not needed on Windows)
+        if system != "windows":
+            os.chmod(chromedriver_path, 0o755)
         
         logging.info(f"ChromeDriver installed at: {chromedriver_path}")
         return str(chromedriver_path)
