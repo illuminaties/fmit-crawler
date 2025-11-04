@@ -31,22 +31,29 @@ def setup_logging() -> None:
 
 
 def create_driver() -> webdriver.Chrome:
-    chrome_options = Options()
-    chrome_options.add_argument("--headless=new")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--window-size=1920,1080")
-    chrome_options.add_argument("--disable-extensions")
-    chrome_options.add_argument("--blink-settings=imagesEnabled=false")
-    
-    # Use CHROME_BIN if provided (e.g., in GitHub Actions)
-    chrome_bin = os.getenv("CHROME_BIN")
-    if chrome_bin:
-        chrome_options.binary_location = chrome_bin
-    
-    service = Service(ChromeDriverManager().install())
-    return webdriver.Chrome(service=service, options=chrome_options)
+    try:
+        chrome_options = Options()
+        chrome_options.add_argument("--headless=new")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--window-size=1920,1080")
+        chrome_options.add_argument("--disable-extensions")
+        chrome_options.add_argument("--blink-settings=imagesEnabled=false")
+        
+        # Use CHROME_BIN if provided (e.g., in GitHub Actions)
+        chrome_bin = os.getenv("CHROME_BIN")
+        if chrome_bin:
+            chrome_options.binary_location = chrome_bin
+            logging.info(f"Using Chrome binary: {chrome_bin}")
+        
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        logging.info("Chrome driver created successfully")
+        return driver
+    except Exception as e:
+        logging.error(f"Failed to create Chrome driver: {e}")
+        raise
 
 
 def save_page_checkpoint(page: int) -> None:
@@ -156,79 +163,92 @@ def extract_url_data(driver: webdriver.Chrome, url: str, max_retries: int = 3) -
 def run_once() -> None:
     setup_logging()
     start_time = time.time()
-    logging.info("START CRAWL (GitHub Actions, Parquet)")
-    logging.info(f"Max runtime: {MAX_RUNTIME_SECONDS}s ({MAX_RUNTIME_SECONDS/3600:.1f}h), Max URLs per run: {MAX_URLS_PER_RUN}")
-    
-    processed = load_processed_urls()
-    driver = create_driver()
-
-    def check_timeout() -> bool:
-        elapsed = time.time() - start_time
-        if elapsed >= MAX_RUNTIME_SECONDS:
-            logging.warning(f"Timeout reached ({elapsed:.0f}s). Stopping gracefully.")
-            return True
-        return False
-
-    start_page = load_page_checkpoint() + 1
-    current_page = max(start_page, 1)
-    all_urls: Set[str] = set()
-
-    logging.info(f"Collect URLs from page {current_page} to {MAX_PAGES}")
-    while current_page <= MAX_PAGES:
-        if check_timeout():
-            break
+    driver = None
+    try:
+        logging.info("START CRAWL (GitHub Actions, Parquet)")
+        logging.info(f"Max runtime: {MAX_RUNTIME_SECONDS}s ({MAX_RUNTIME_SECONDS/3600:.1f}h), Max URLs per run: {MAX_URLS_PER_RUN}")
         
-        url = BASE_URL if current_page == 1 else f"{BASE_URL}?page={current_page}"
-        hrefs, driver = extract_page_links(driver, url)
-        new_hrefs = [h for h in hrefs if h not in processed and h not in all_urls]
-        all_urls.update(new_hrefs)
-        if new_hrefs or hrefs:
-            save_page_checkpoint(current_page)
-        
-        elapsed = time.time() - start_time
-        logging.info(f"Page {current_page}: +{len(new_hrefs)} new links (total: {len(all_urls)}), elapsed: {elapsed/60:.1f}m")
-        
-        current_page += 1
-        time.sleep(1.5)  # Reduced from 2
-        if len(all_urls) >= MAX_URLS_PER_RUN:
-            logging.info(f"Reached max URLs limit ({MAX_URLS_PER_RUN})")
-            break
+        processed = load_processed_urls()
+        driver = create_driver()
 
-    logging.info(f"Total new URLs this run: {len(all_urls)}")
+        def check_timeout() -> bool:
+            elapsed = time.time() - start_time
+            if elapsed >= MAX_RUNTIME_SECONDS:
+                logging.warning(f"Timeout reached ({elapsed:.0f}s). Stopping gracefully.")
+                return True
+            return False
 
-    if all_urls and not check_timeout():
-        batch: List[Dict[str, str]] = []
-        for idx, url in enumerate(all_urls, 1):
+        start_page = load_page_checkpoint() + 1
+        current_page = max(start_page, 1)
+        all_urls: Set[str] = set()
+
+        logging.info(f"Collect URLs from page {current_page} to {MAX_PAGES}")
+        while current_page <= MAX_PAGES:
             if check_timeout():
-                logging.warning(f"Timeout during URL processing. Processed {idx-1}/{len(all_urls)} URLs.")
                 break
             
-            data, driver = extract_url_data(driver, url)
-            batch.append(data)
+            url = BASE_URL if current_page == 1 else f"{BASE_URL}?page={current_page}"
+            hrefs, driver = extract_page_links(driver, url)
+            new_hrefs = [h for h in hrefs if h not in processed and h not in all_urls]
+            all_urls.update(new_hrefs)
+            if new_hrefs or hrefs:
+                save_page_checkpoint(current_page)
             
-            if len(batch) >= 50:
+            elapsed = time.time() - start_time
+            logging.info(f"Page {current_page}: +{len(new_hrefs)} new links (total: {len(all_urls)}), elapsed: {elapsed/60:.1f}m")
+            
+            current_page += 1
+            time.sleep(1.5)  # Reduced from 2
+            if len(all_urls) >= MAX_URLS_PER_RUN:
+                logging.info(f"Reached max URLs limit ({MAX_URLS_PER_RUN})")
+                break
+
+        logging.info(f"Total new URLs this run: {len(all_urls)}")
+
+        if all_urls and not check_timeout():
+            batch: List[Dict[str, str]] = []
+            for idx, url in enumerate(all_urls, 1):
+                if check_timeout():
+                    logging.warning(f"Timeout during URL processing. Processed {idx-1}/{len(all_urls)} URLs.")
+                    break
+                
+                data, driver = extract_url_data(driver, url)
+                batch.append(data)
+                
+                if len(batch) >= 50:
+                    append_to_parquet(batch)
+                    batch = []
+                    elapsed = time.time() - start_time
+                    remaining = len(all_urls) - idx
+                    eta_minutes = (elapsed / idx) * remaining / 60 if idx > 0 else 0
+                    logging.info(f"Saved {idx}/{len(all_urls)} URLs, elapsed: {elapsed/60:.1f}m, ETA: {eta_minutes:.1f}m")
+                
+                time.sleep(1)  # Reduced from 1.5
+
+            if batch:
                 append_to_parquet(batch)
-                batch = []
-                elapsed = time.time() - start_time
-                remaining = len(all_urls) - idx
-                eta_minutes = (elapsed / idx) * remaining / 60 if idx > 0 else 0
-                logging.info(f"Saved {idx}/{len(all_urls)} URLs, elapsed: {elapsed/60:.1f}m, ETA: {eta_minutes:.1f}m")
-            
-            time.sleep(1)  # Reduced from 1.5
 
-        if batch:
-            append_to_parquet(batch)
-
-    try:
-        driver.quit()
-    except Exception:
-        pass
-    
-    total_time = time.time() - start_time
-    logging.info(f"DONE. Data saved in Parquet. Total time: {total_time/60:.1f}m ({total_time/3600:.2f}h). Can resume next run.")
+        total_time = time.time() - start_time
+        logging.info(f"DONE. Data saved in Parquet. Total time: {total_time/60:.1f}m ({total_time/3600:.2f}h). Can resume next run.")
+    finally:
+        if driver:
+            try:
+                driver.quit()
+                logging.info("Chrome driver closed")
+            except Exception as e:
+                logging.warning(f"Error closing driver: {e}")
 
 
 if __name__ == "__main__":
-    run_once()
+    import sys
+    try:
+        run_once()
+        sys.exit(0)
+    except KeyboardInterrupt:
+        logging.warning("Interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        logging.error(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
 
 
