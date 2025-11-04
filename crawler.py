@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import json
 import logging
@@ -32,6 +33,7 @@ def setup_logging() -> None:
 
 def create_driver() -> webdriver.Chrome:
     try:
+        logging.info("Creating Chrome driver...")
         chrome_options = Options()
         chrome_options.add_argument("--headless=new")
         chrome_options.add_argument("--no-sandbox")
@@ -46,13 +48,27 @@ def create_driver() -> webdriver.Chrome:
         if chrome_bin:
             chrome_options.binary_location = chrome_bin
             logging.info(f"Using Chrome binary: {chrome_bin}")
+        else:
+            logging.info("CHROME_BIN not set, using default Chrome")
         
-        service = Service(ChromeDriverManager().install())
+        # Install ChromeDriver
+        logging.info("Installing ChromeDriver...")
+        try:
+            driver_path = ChromeDriverManager().install()
+            logging.info(f"ChromeDriver installed at: {driver_path}")
+        except Exception as e:
+            logging.error(f"ChromeDriverManager failed: {e}")
+            # Try to use system chromedriver if available
+            logging.info("Trying to use system chromedriver...")
+            driver_path = None
+        
+        service = Service(driver_path) if driver_path else Service()
+        logging.info("Starting Chrome browser...")
         driver = webdriver.Chrome(service=service, options=chrome_options)
         logging.info("Chrome driver created successfully")
         return driver
     except Exception as e:
-        logging.error(f"Failed to create Chrome driver: {e}")
+        logging.error(f"Failed to create Chrome driver: {e}", exc_info=True)
         raise
 
 
@@ -165,10 +181,20 @@ def run_once() -> None:
     start_time = time.time()
     driver = None
     try:
+        logging.info("=" * 60)
         logging.info("START CRAWL (GitHub Actions, Parquet)")
-        logging.info(f"Max runtime: {MAX_RUNTIME_SECONDS}s ({MAX_RUNTIME_SECONDS/3600:.1f}h), Max URLs per run: {MAX_URLS_PER_RUN}")
+        logging.info("=" * 60)
+        logging.info(f"Python version: {sys.version}")
+        logging.info(f"Max runtime: {MAX_RUNTIME_SECONDS}s ({MAX_RUNTIME_SECONDS/3600:.1f}h)")
+        logging.info(f"Max URLs per run: {MAX_URLS_PER_RUN}")
+        logging.info(f"DATA_DIR: {DATA_DIR}")
+        logging.info(f"CHROME_BIN: {os.getenv('CHROME_BIN', 'Not set')}")
         
+        logging.info("Loading processed URLs...")
         processed = load_processed_urls()
+        logging.info(f"Found {len(processed)} already processed URLs")
+        
+        logging.info("Creating Chrome driver...")
         driver = create_driver()
 
         def check_timeout() -> bool:
