@@ -21,6 +21,10 @@ PAGE_CHECKPOINT = os.path.join(DATA_DIR, "page_checkpoint.json")
 BASE_URL = "https://fmit.vn/en/glossary"
 MAX_PAGES = 6729
 
+# Timeout settings (5.5 hours = 19800 seconds) - leave buffer for GitHub Actions 6-hour limit
+MAX_RUNTIME_SECONDS = int(os.getenv("MAX_RUNTIME_SECONDS", "19800"))  # 5.5 hours default
+MAX_URLS_PER_RUN = int(os.getenv("MAX_URLS_PER_RUN", "500"))  # Reduced from 1500
+
 
 def setup_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -102,11 +106,11 @@ def append_to_parquet(rows: List[Dict[str, str]]) -> None:
     write_parquet_df(df)
 
 
-def extract_page_links(driver: webdriver.Chrome, url: str, max_retries: int = 5) -> Tuple[List[str], webdriver.Chrome]:
+def extract_page_links(driver: webdriver.Chrome, url: str, max_retries: int = 3) -> Tuple[List[str], webdriver.Chrome]:
     for _ in range(max_retries):
         try:
             driver.get(url)
-            time.sleep(3)
+            time.sleep(2)  # Reduced from 3
             items = driver.find_element(By.CLASS_NAME, "dictionary-items")
             links = items.find_elements(By.XPATH, './/li[@class="item"]/a[@href]')
             hrefs: List[str] = []
@@ -116,16 +120,16 @@ def extract_page_links(driver: webdriver.Chrome, url: str, max_retries: int = 5)
                     hrefs.append(href)
             return list(set(hrefs)), driver
         except Exception as e:
-            logging.warning(f"Page error {url}: {e}. Retry in 10s...")
-            time.sleep(10)
+            logging.warning(f"Page error {url}: {e}. Retry in 5s...")
+            time.sleep(5)  # Reduced from 10
     return [], driver
 
 
-def extract_url_data(driver: webdriver.Chrome, url: str, max_retries: int = 5) -> Tuple[Dict[str, str], webdriver.Chrome]:
+def extract_url_data(driver: webdriver.Chrome, url: str, max_retries: int = 3) -> Tuple[Dict[str, str], webdriver.Chrome]:
     for _ in range(max_retries):
         try:
             driver.get(url)
-            time.sleep(2)
+            time.sleep(1.5)  # Reduced from 2
             h1 = h2 = content = ""
             try:
                 h1_el = driver.find_element(By.CSS_SELECTOR, "h1.dictionary-detail-title")
@@ -144,16 +148,26 @@ def extract_url_data(driver: webdriver.Chrome, url: str, max_retries: int = 5) -
                 pass
             return {"url": url, "h1": h1, "h2": h2, "content": content}, driver
         except Exception as e:
-            logging.warning(f"URL error {url}: {e}. Retry in 10s...")
-            time.sleep(10)
+            logging.warning(f"URL error {url}: {e}. Retry in 5s...")
+            time.sleep(5)  # Reduced from 10
     return {"url": url, "h1": "", "h2": "", "content": ""}, driver
 
 
 def run_once() -> None:
     setup_logging()
+    start_time = time.time()
     logging.info("START CRAWL (GitHub Actions, Parquet)")
+    logging.info(f"Max runtime: {MAX_RUNTIME_SECONDS}s ({MAX_RUNTIME_SECONDS/3600:.1f}h), Max URLs per run: {MAX_URLS_PER_RUN}")
+    
     processed = load_processed_urls()
     driver = create_driver()
+
+    def check_timeout() -> bool:
+        elapsed = time.time() - start_time
+        if elapsed >= MAX_RUNTIME_SECONDS:
+            logging.warning(f"Timeout reached ({elapsed:.0f}s). Stopping gracefully.")
+            return True
+        return False
 
     start_page = load_page_checkpoint() + 1
     current_page = max(start_page, 1)
@@ -161,38 +175,57 @@ def run_once() -> None:
 
     logging.info(f"Collect URLs from page {current_page} to {MAX_PAGES}")
     while current_page <= MAX_PAGES:
+        if check_timeout():
+            break
+        
         url = BASE_URL if current_page == 1 else f"{BASE_URL}?page={current_page}"
         hrefs, driver = extract_page_links(driver, url)
         new_hrefs = [h for h in hrefs if h not in processed and h not in all_urls]
         all_urls.update(new_hrefs)
         if new_hrefs or hrefs:
             save_page_checkpoint(current_page)
-        logging.info(f"Page {current_page}: +{len(new_hrefs)} new links (total: {len(all_urls)})")
+        
+        elapsed = time.time() - start_time
+        logging.info(f"Page {current_page}: +{len(new_hrefs)} new links (total: {len(all_urls)}), elapsed: {elapsed/60:.1f}m")
+        
         current_page += 1
-        time.sleep(2)
-        if len(all_urls) >= 1500:
+        time.sleep(1.5)  # Reduced from 2
+        if len(all_urls) >= MAX_URLS_PER_RUN:
+            logging.info(f"Reached max URLs limit ({MAX_URLS_PER_RUN})")
             break
 
     logging.info(f"Total new URLs this run: {len(all_urls)}")
 
-    batch: List[Dict[str, str]] = []
-    for idx, url in enumerate(all_urls, 1):
-        data, driver = extract_url_data(driver, url)
-        batch.append(data)
-        if len(batch) >= 50:
-            append_to_parquet(batch)
-            batch = []
-            logging.info(f"Saved {idx}/{len(all_urls)} URLs")
-        time.sleep(1.5)
+    if all_urls and not check_timeout():
+        batch: List[Dict[str, str]] = []
+        for idx, url in enumerate(all_urls, 1):
+            if check_timeout():
+                logging.warning(f"Timeout during URL processing. Processed {idx-1}/{len(all_urls)} URLs.")
+                break
+            
+            data, driver = extract_url_data(driver, url)
+            batch.append(data)
+            
+            if len(batch) >= 50:
+                append_to_parquet(batch)
+                batch = []
+                elapsed = time.time() - start_time
+                remaining = len(all_urls) - idx
+                eta_minutes = (elapsed / idx) * remaining / 60 if idx > 0 else 0
+                logging.info(f"Saved {idx}/{len(all_urls)} URLs, elapsed: {elapsed/60:.1f}m, ETA: {eta_minutes:.1f}m")
+            
+            time.sleep(1)  # Reduced from 1.5
 
-    if batch:
-        append_to_parquet(batch)
+        if batch:
+            append_to_parquet(batch)
 
     try:
         driver.quit()
     except Exception:
         pass
-    logging.info("DONE. Data saved in Parquet and can resume next run.")
+    
+    total_time = time.time() - start_time
+    logging.info(f"DONE. Data saved in Parquet. Total time: {total_time/60:.1f}m ({total_time/3600:.2f}h). Can resume next run.")
 
 
 if __name__ == "__main__":
