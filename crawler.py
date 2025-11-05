@@ -429,90 +429,151 @@ def run_once() -> None:
     logging.info("START CRAWL (GitHub Actions, Parquet)")
     logging.info("=" * 60)
     
+    # Set maximum runtime (5.5 hours to stay under 6-hour limit)
+    MAX_RUNTIME_SECONDS = 5.5 * 60 * 60  # 5.5 hours
+    start_time = time.time()
+    
     processed = load_processed_urls()
     logging.info(f"Loaded {len(processed)} already processed URLs")
     
     driver = create_driver()
 
-    # Phase 1: Collect URLs from 10 pages (~600 links)
-    start_page = load_page_checkpoint() + 1
-    current_page = max(start_page, 1)
-    all_urls: Set[str] = set()
-    pages_to_collect = 10  # Collect from 10 pages per run
+    all_urls_collected: Set[str] = set()
+    total_successful_extractions = 0
+    total_failed_extractions = 0
+    total_pages_processed = 0
     
-    logging.info(f"Phase 1: Collecting URLs from {pages_to_collect} pages (starting at page {current_page})")
-    
-    pages_processed = 0
-    while current_page <= MAX_PAGES and pages_processed < pages_to_collect:
-        url = BASE_URL if current_page == 1 else f"{BASE_URL}?page={current_page}"
-        hrefs, driver = extract_page_links(driver, url)
-        new_hrefs = [h for h in hrefs if h not in processed and h not in all_urls]
-        all_urls.update(new_hrefs)
+    # Continuous loop: process batches until time limit or all pages done
+    while True:
+        elapsed_time = time.time() - start_time
+        remaining_time = MAX_RUNTIME_SECONDS - elapsed_time
         
-        # Always save checkpoint after processing a page
-        save_page_checkpoint(current_page)
-        pages_processed += 1
+        if remaining_time < 600:  # Less than 10 minutes left, stop
+            logging.warning(f"⏰ Only {remaining_time/60:.1f} minutes remaining. Stopping to avoid timeout.")
+            break
         
-        logging.info(f"Page {current_page}: Found {len(hrefs)} links, {len(new_hrefs)} new (total: {len(all_urls)})")
+        # Phase 1: Collect URLs from 10 pages (~600 links)
+        start_page = load_page_checkpoint() + 1
+        current_page = max(start_page, 1)
         
-        current_page += 1
-        time.sleep(2)
-    
-    logging.info(f"Phase 1 Complete: Collected {len(all_urls)} new URLs from {pages_processed} pages")
-    
-    if not all_urls:
-        logging.info("No new URLs to process. Next run will continue from page checkpoint.")
-        try:
-            driver.quit()
-        except Exception:
-            pass
-        return
-
-    # Phase 2: Extract content from URLs in small batches and save incrementally
-    logging.info("=" * 60)
-    logging.info(f"Phase 2: Extracting content from {len(all_urls)} URLs")
-    logging.info("=" * 60)
-    
-    batch: List[Dict[str, str]] = []
-    successful_extractions = 0
-    failed_extractions = 0
-    batch_size = 20  # Save every 20 successful extractions
-    
-    for idx, url in enumerate(all_urls, 1):
-        try:
-            data, driver = extract_url_data(driver, url)
-            
-            # Only append if we got actual content (not empty)
-            if data.get("h1") or data.get("h2") or data.get("content"):
-                batch.append(data)
-                successful_extractions += 1
-                logging.info(f"[{idx}/{len(all_urls)}] ✅ Extracted: {url[:80]}...")
-            else:
-                failed_extractions += 1
-                logging.warning(f"[{idx}/{len(all_urls)}] ⚠️  Empty content: {url[:80]}...")
-            
-            # Save batch incrementally to avoid data loss
-            if len(batch) >= batch_size:
-                append_to_parquet(batch)
-                logging.info(f"💾 Saved batch of {len(batch)} URLs to parquet (Total saved: {successful_extractions})")
-                batch = []
+        if current_page > MAX_PAGES:
+            logging.info("✅ All pages processed! Crawling complete.")
+            break
+        
+        batch_urls: Set[str] = set()
+        pages_to_collect = 10  # Collect from 10 pages per batch
+        
+        logging.info(f"⏱️  Runtime: {elapsed_time/3600:.2f}h | Remaining: {remaining_time/3600:.2f}h")
+        logging.info(f"Phase 1: Collecting URLs from {pages_to_collect} pages (starting at page {current_page})")
+        
+        pages_processed = 0
+        while current_page <= MAX_PAGES and pages_processed < pages_to_collect:
+            # Check time limit
+            if time.time() - start_time > MAX_RUNTIME_SECONDS - 600:
+                logging.warning("⏰ Approaching time limit, stopping URL collection")
+                break
                 
-        except Exception as e:
-            failed_extractions += 1
-            logging.error(f"[{idx}/{len(all_urls)}] ❌ Failed to extract {url[:80]}...: {e}")
+            url = BASE_URL if current_page == 1 else f"{BASE_URL}?page={current_page}"
+            hrefs, driver = extract_page_links(driver, url)
+            new_hrefs = [h for h in hrefs if h not in processed and h not in all_urls_collected and h not in batch_urls]
+            batch_urls.update(new_hrefs)
+            
+            # Always save checkpoint after processing a page
+            save_page_checkpoint(current_page)
+            pages_processed += 1
+            total_pages_processed += 1
+            
+            logging.info(f"Page {current_page}: Found {len(hrefs)} links, {len(new_hrefs)} new (batch: {len(batch_urls)})")
+            
+            current_page += 1
+            time.sleep(2)
         
-        time.sleep(1.5)
-
-    # Save remaining batch
-    if batch:
-        append_to_parquet(batch)
-        logging.info(f"💾 Saved final batch of {len(batch)} URLs to parquet")
-
+        logging.info(f"Phase 1 Complete: Collected {len(batch_urls)} new URLs from {pages_processed} pages")
+        all_urls_collected.update(batch_urls)
+        
+        if not batch_urls:
+            logging.info("No new URLs to process in this batch. Continuing to next batch...")
+            # Still increment checkpoint even if no links found
+            if current_page <= MAX_PAGES:
+                save_page_checkpoint(current_page - 1)
+            continue
+        
+        # Phase 2: Extract content from URLs in small batches and save incrementally
+        logging.info("=" * 60)
+        logging.info(f"Phase 2: Extracting content from {len(batch_urls)} URLs")
+        logging.info("=" * 60)
+        
+        batch: List[Dict[str, str]] = []
+        successful_extractions = 0
+        failed_extractions = 0
+        batch_size = 20  # Save every 20 successful extractions
+        
+        for idx, url in enumerate(batch_urls, 1):
+            # Check time limit
+            if time.time() - start_time > MAX_RUNTIME_SECONDS - 300:  # 5 min buffer
+                logging.warning("⏰ Approaching time limit, stopping content extraction")
+                break
+                
+            try:
+                data, driver = extract_url_data(driver, url)
+                
+                # Only append if we got actual content (not empty)
+                if data.get("h1") or data.get("h2") or data.get("content"):
+                    batch.append(data)
+                    successful_extractions += 1
+                    logging.info(f"[{idx}/{len(batch_urls)}] ✅ Extracted: {url[:80]}...")
+                else:
+                    failed_extractions += 1
+                    logging.warning(f"[{idx}/{len(batch_urls)}] ⚠️  Empty content: {url[:80]}...")
+                
+                # Save batch incrementally to avoid data loss
+                if len(batch) >= batch_size:
+                    append_to_parquet(batch)
+                    logging.info(f"💾 Saved batch of {len(batch)} URLs to parquet")
+                    batch = []
+                    
+            except Exception as e:
+                failed_extractions += 1
+                logging.error(f"[{idx}/{len(batch_urls)}] ❌ Failed to extract {url[:80]}...: {e}")
+            
+            time.sleep(1.5)
+        
+        # Save remaining batch
+        if batch:
+            append_to_parquet(batch)
+            logging.info(f"💾 Saved final batch of {len(batch)} URLs to parquet")
+        
+        total_successful_extractions += successful_extractions
+        total_failed_extractions += failed_extractions
+        
+        logging.info(f"Batch Complete: ✅ {successful_extractions} successful | ❌ {failed_extractions} failed")
+        
+        # Commit after each batch to save progress
+        logging.info("💾 Committing progress to git...")
+        try:
+            import subprocess
+            subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=False)
+            subprocess.run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"], check=False)
+            subprocess.run(["git", "add", "-A"], check=False)
+            subprocess.run(["git", "commit", "-m", f"data: batch update - pages {start_page}-{current_page-1}, {successful_extractions} URLs"], check=False)
+            subprocess.run(["git", "push"], check=False)
+            logging.info("✅ Progress committed to git")
+        except Exception as e:
+            logging.warning(f"⚠️  Could not commit to git: {e}")
+        
+        # Check if we should continue
+        elapsed_time = time.time() - start_time
+        if elapsed_time > MAX_RUNTIME_SECONDS - 600:
+            logging.warning("⏰ Approaching time limit, stopping crawler")
+            break
+    
     logging.info("=" * 60)
-    logging.info(f"Phase 2 Complete:")
-    logging.info(f"  ✅ Successful: {successful_extractions}")
-    logging.info(f"  ❌ Failed: {failed_extractions}")
-    logging.info(f"  📄 Total processed: {len(all_urls)}")
+    logging.info(f"RUN COMPLETE:")
+    logging.info(f"  📄 Pages processed: {total_pages_processed}")
+    logging.info(f"  🔗 URLs collected: {len(all_urls_collected)}")
+    logging.info(f"  ✅ Successful extractions: {total_successful_extractions}")
+    logging.info(f"  ❌ Failed extractions: {total_failed_extractions}")
+    logging.info(f"  ⏱️  Runtime: {(time.time() - start_time)/3600:.2f} hours")
     logging.info("=" * 60)
 
     try:
