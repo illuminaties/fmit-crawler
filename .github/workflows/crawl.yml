@@ -1,8 +1,6 @@
 name: FMIT Crawler (cron)
 
 on:
-  schedule:
-    - cron: '0 */1 * * *'  # Fallback: run every hour if auto-trigger fails
   workflow_dispatch:
 
 permissions:
