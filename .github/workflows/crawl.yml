@@ -9,6 +9,10 @@ permissions:
   contents: write
   actions: write  # Needed to trigger workflow
 
+concurrency:
+  group: fmit-crawler
+  cancel-in-progress: false
+
 jobs:
   crawl:
     runs-on: ubuntu-latest
@@ -47,7 +51,21 @@ jobs:
           if ! git diff --quiet || ! git diff --cached --quiet; then
             git add -A
             git commit -m "data: final update $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            git push
+            # Retry push up to 5 times to handle non-fast-forward due to concurrent runs
+            for i in 1 2 3 4 5; do
+              if git push; then
+                echo "Push succeeded"; break
+              else
+                echo "Push failed, attempt $i. Fetching and rebasing..."
+                git fetch origin
+                # Rebase onto latest remote main (or current ref)
+                CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+                git rebase origin/$CURRENT_BRANCH || git rebase --abort
+              fi
+              if [ "$i" = "5" ]; then
+                echo "Push failed after retries"; exit 1
+              fi
+            done
           else
             echo "No changes to commit."
           fi
