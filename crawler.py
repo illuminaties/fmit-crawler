@@ -429,15 +429,29 @@ def append_to_files(rows: List[Dict[str, str]]) -> None:
         logging.debug(f"Appended {appended_count} records to JSONL file")
     
     # Append to TXT file (true append - human-readable format)
+    # Check existing URLs in TXT file
+    txt_existing_urls = set()
+    if os.path.exists(OUTPUT_TXT_FILE):
+        try:
+            with open(OUTPUT_TXT_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip() and not line.startswith("#"):
+                        parts = line.split(" | ", 1)
+                        if parts:
+                            txt_existing_urls.add(parts[0].strip())
+        except:
+            pass
+    
     appended_count = 0
     with open(OUTPUT_TXT_FILE, "a", encoding="utf-8") as f:
         for row in rows:
-            if row.get("url") and row["url"] not in existing_urls:
+            if row.get("url") and row["url"] not in txt_existing_urls:
                 url = row.get("url", "")
                 h1 = row.get("h1", "").replace("\n", " ").replace("|", "│")
                 h2 = row.get("h2", "").replace("\n", " ").replace("|", "│")
                 content = row.get("content", "").replace("\n", " ").replace("|", "│")[:500]  # Limit content length
                 f.write(f"{url} | {h1} | {h2} | {content}\n")
+                txt_existing_urls.add(row["url"])
                 appended_count += 1
     
     if appended_count > 0:
