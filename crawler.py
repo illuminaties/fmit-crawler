@@ -25,6 +25,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 PARQUET_FILE = os.path.join(DATA_DIR, "fmit_data.parquet")
 PAGE_CHECKPOINT = os.path.join(DATA_DIR, "page_checkpoint.json")
+OUTPUT_JSON_FILE = os.path.join(DATA_DIR, "fmit_data.jsonl")  # JSON Lines format (append-friendly)
+OUTPUT_TXT_FILE = os.path.join(DATA_DIR, "fmit_data.txt")  # Plain text format
 
 BASE_URL = "https://fmit.vn/en/glossary"
 MAX_PAGES = 6729
@@ -326,7 +328,7 @@ def initialize_output_files() -> None:
     # Ensure data directory exists
     os.makedirs(DATA_DIR, exist_ok=True)
     
-    # Initialize parquet file if it doesn't exist
+    # Create empty parquet file if it doesn't exist
     if not os.path.exists(PARQUET_FILE):
         empty_df = pd.DataFrame(columns=["url", "h1", "h2", "content"])
         write_parquet_df(empty_df)
@@ -335,6 +337,32 @@ def initialize_output_files() -> None:
         file_size = os.path.getsize(PARQUET_FILE) / 1024 / 1024
         df = read_parquet_df()
         logging.info(f"✅ Parquet file exists: {PARQUET_FILE} ({len(df)} records, {file_size:.2f} MB)")
+    
+    # Create empty JSONL file if it doesn't exist (JSON Lines format - append-friendly)
+    if not os.path.exists(OUTPUT_JSON_FILE):
+        with open(OUTPUT_JSON_FILE, "w", encoding="utf-8") as f:
+            pass  # Create empty file
+        logging.info(f"✅ Created empty JSONL file: {OUTPUT_JSON_FILE}")
+    else:
+        # Count lines in JSONL file
+        with open(OUTPUT_JSON_FILE, "r", encoding="utf-8") as f:
+            line_count = sum(1 for _ in f)
+        file_size = os.path.getsize(OUTPUT_JSON_FILE) / 1024 / 1024
+        logging.info(f"✅ JSONL file exists: {OUTPUT_JSON_FILE} ({line_count} records, {file_size:.2f} MB)")
+    
+    # Create empty TXT file if it doesn't exist
+    if not os.path.exists(OUTPUT_TXT_FILE):
+        with open(OUTPUT_TXT_FILE, "w", encoding="utf-8") as f:
+            f.write("# FMIT Crawler Data\n")
+            f.write("# Format: URL | H1 | H2 | Content\n")
+            f.write("# " + "="*80 + "\n")
+        logging.info(f"✅ Created empty TXT file: {OUTPUT_TXT_FILE}")
+    else:
+        # Count lines in TXT file (excluding header)
+        with open(OUTPUT_TXT_FILE, "r", encoding="utf-8") as f:
+            line_count = sum(1 for line in f if not line.startswith("#"))
+        file_size = os.path.getsize(OUTPUT_TXT_FILE) / 1024 / 1024
+        logging.info(f"✅ TXT file exists: {OUTPUT_TXT_FILE} ({line_count} records, {file_size:.2f} MB)")
     
     # Initialize checkpoint file if it doesn't exist
     if not os.path.exists(PAGE_CHECKPOINT):
@@ -345,39 +373,75 @@ def initialize_output_files() -> None:
         logging.info(f"✅ Checkpoint file exists: {PAGE_CHECKPOINT} (last page: {last_page})")
 
 
-def append_to_parquet(rows: List[Dict[str, str]]) -> None:
-    """Append new rows to parquet file, avoiding duplicates."""
+def append_to_files(rows: List[Dict[str, str]]) -> None:
+    """Append new rows to all output files (Parquet, JSONL, TXT)."""
     if not rows:
         return
     
-    # Ensure output file exists
-    if not os.path.exists(PARQUET_FILE):
+    # Ensure output files exist
+    if not os.path.exists(PARQUET_FILE) or not os.path.exists(OUTPUT_JSON_FILE) or not os.path.exists(OUTPUT_TXT_FILE):
         initialize_output_files()
     
+    # Append to Parquet (read-all, merge, write-all)
     new_df = pd.DataFrame(rows)
-    # Ensure all required columns exist
     for col in ["url", "h1", "h2", "content"]:
         if col not in new_df.columns:
             new_df[col] = ""
     
-    # Read existing data
     old_df = read_parquet_df()
-    
-    # Remove duplicates based on URL
     if not old_df.empty and "url" in old_df.columns and "url" in new_df.columns:
         new_df = new_df[~new_df["url"].isin(old_df["url"])]
         if new_df.empty:
             logging.debug("All URLs already exist in parquet file, skipping append")
             return
-        # Append new data to existing
         df = pd.concat([old_df, new_df], ignore_index=True)
     else:
-        # First time writing
         df = new_df
-    
-    # Write back to file
     write_parquet_df(df)
-    logging.debug(f"Appended {len(new_df)} new records to parquet (total: {len(df)})")
+    logging.debug(f"Appended {len(new_df)} records to parquet (total: {len(df)})")
+    
+    # Append to JSONL file (true append - one JSON object per line)
+    existing_urls = set()
+    if os.path.exists(OUTPUT_JSON_FILE):
+        try:
+            with open(OUTPUT_JSON_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        try:
+                            record = json.loads(line)
+                            if "url" in record:
+                                existing_urls.add(record["url"])
+                        except:
+                            pass
+        except:
+            pass
+    
+    appended_count = 0
+    with open(OUTPUT_JSON_FILE, "a", encoding="utf-8") as f:
+        for row in rows:
+            if row.get("url") and row["url"] not in existing_urls:
+                json_line = json.dumps(row, ensure_ascii=False)
+                f.write(json_line + "\n")
+                existing_urls.add(row["url"])
+                appended_count += 1
+    
+    if appended_count > 0:
+        logging.debug(f"Appended {appended_count} records to JSONL file")
+    
+    # Append to TXT file (true append - human-readable format)
+    appended_count = 0
+    with open(OUTPUT_TXT_FILE, "a", encoding="utf-8") as f:
+        for row in rows:
+            if row.get("url") and row["url"] not in existing_urls:
+                url = row.get("url", "")
+                h1 = row.get("h1", "").replace("\n", " ").replace("|", "│")
+                h2 = row.get("h2", "").replace("\n", " ").replace("|", "│")
+                content = row.get("content", "").replace("\n", " ").replace("|", "│")[:500]  # Limit content length
+                f.write(f"{url} | {h1} | {h2} | {content}\n")
+                appended_count += 1
+    
+    if appended_count > 0:
+        logging.debug(f"Appended {appended_count} records to TXT file")
 
 
 def extract_page_links(driver: webdriver.Chrome, url: str, max_retries: int = 5) -> Tuple[List[str], webdriver.Chrome]:
@@ -573,8 +637,8 @@ def run_once() -> None:
             
             # Save batch incrementally to avoid data loss
             if len(batch) >= batch_size:
-                append_to_parquet(batch)
-                logging.info(f"💾 Saved batch of {len(batch)} URLs to parquet")
+                append_to_files(batch)
+                logging.info(f"💾 Saved batch of {len(batch)} URLs to output files")
                 batch = []
                 
         except Exception as e:
@@ -585,8 +649,8 @@ def run_once() -> None:
     
     # Save remaining batch
     if batch:
-        append_to_parquet(batch)
-        logging.info(f"💾 Saved final batch of {len(batch)} URLs to parquet")
+        append_to_files(batch)
+        logging.info(f"💾 Saved final batch of {len(batch)} URLs to output files")
     
     total_successful_extractions = successful_extractions
     total_failed_extractions = failed_extractions
