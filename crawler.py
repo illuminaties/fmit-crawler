@@ -434,17 +434,31 @@ def run_once() -> None:
     all_urls: Set[str] = set()
 
     logging.info(f"Collect URLs from page {current_page} to {MAX_PAGES}")
+    pages_processed = 0
     while current_page <= MAX_PAGES:
         url = BASE_URL if current_page == 1 else f"{BASE_URL}?page={current_page}"
         hrefs, driver = extract_page_links(driver, url)
         new_hrefs = [h for h in hrefs if h not in processed and h not in all_urls]
         all_urls.update(new_hrefs)
-        if new_hrefs or hrefs:
-            save_page_checkpoint(current_page)
-        logging.info(f"Page {current_page}: +{len(new_hrefs)} new links (total: {len(all_urls)})")
+        
+        # Always save checkpoint after processing a page, even if no links found
+        # This ensures we don't repeat the same page on next run
+        save_page_checkpoint(current_page)
+        pages_processed += 1
+        
+        logging.info(f"Page {current_page}: Found {len(hrefs)} links, {len(new_hrefs)} new (total: {len(all_urls)})")
+        
         current_page += 1
         time.sleep(2)
-        if len(all_urls) >= 1500:
+        
+        # Limit to 500 URLs per run to avoid timeout, but continue processing pages
+        if len(all_urls) >= 500:
+            logging.info(f"Reached 500 URLs limit, stopping URL collection")
+            break
+        
+        # Also limit pages per run to avoid timeout (process max 100 pages per run)
+        if pages_processed >= 100:
+            logging.info(f"Processed {pages_processed} pages in this run, stopping to avoid timeout")
             break
 
     logging.info(f"Total new URLs this run: {len(all_urls)}")
