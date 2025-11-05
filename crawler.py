@@ -425,24 +425,31 @@ def extract_url_data(driver: webdriver.Chrome, url: str, max_retries: int = 5) -
 
 def run_once() -> None:
     setup_logging()
+    logging.info("=" * 60)
     logging.info("START CRAWL (GitHub Actions, Parquet)")
+    logging.info("=" * 60)
+    
     processed = load_processed_urls()
+    logging.info(f"Loaded {len(processed)} already processed URLs")
+    
     driver = create_driver()
 
+    # Phase 1: Collect URLs from 10 pages (~600 links)
     start_page = load_page_checkpoint() + 1
     current_page = max(start_page, 1)
     all_urls: Set[str] = set()
-
-    logging.info(f"Collect URLs from page {current_page} to {MAX_PAGES}")
+    pages_to_collect = 10  # Collect from 10 pages per run
+    
+    logging.info(f"Phase 1: Collecting URLs from {pages_to_collect} pages (starting at page {current_page})")
+    
     pages_processed = 0
-    while current_page <= MAX_PAGES:
+    while current_page <= MAX_PAGES and pages_processed < pages_to_collect:
         url = BASE_URL if current_page == 1 else f"{BASE_URL}?page={current_page}"
         hrefs, driver = extract_page_links(driver, url)
         new_hrefs = [h for h in hrefs if h not in processed and h not in all_urls]
         all_urls.update(new_hrefs)
         
-        # Always save checkpoint after processing a page, even if no links found
-        # This ensures we don't repeat the same page on next run
+        # Always save checkpoint after processing a page
         save_page_checkpoint(current_page)
         pages_processed += 1
         
@@ -450,37 +457,70 @@ def run_once() -> None:
         
         current_page += 1
         time.sleep(2)
-        
-        # Limit to 500 URLs per run to avoid timeout, but continue processing pages
-        if len(all_urls) >= 500:
-            logging.info(f"Reached 500 URLs limit, stopping URL collection")
-            break
-        
-        # Also limit pages per run to avoid timeout (process max 100 pages per run)
-        if pages_processed >= 100:
-            logging.info(f"Processed {pages_processed} pages in this run, stopping to avoid timeout")
-            break
+    
+    logging.info(f"Phase 1 Complete: Collected {len(all_urls)} new URLs from {pages_processed} pages")
+    
+    if not all_urls:
+        logging.info("No new URLs to process. Next run will continue from page checkpoint.")
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        return
 
-    logging.info(f"Total new URLs this run: {len(all_urls)}")
-
+    # Phase 2: Extract content from URLs in small batches and save incrementally
+    logging.info("=" * 60)
+    logging.info(f"Phase 2: Extracting content from {len(all_urls)} URLs")
+    logging.info("=" * 60)
+    
     batch: List[Dict[str, str]] = []
+    successful_extractions = 0
+    failed_extractions = 0
+    batch_size = 20  # Save every 20 successful extractions
+    
     for idx, url in enumerate(all_urls, 1):
-        data, driver = extract_url_data(driver, url)
-        batch.append(data)
-        if len(batch) >= 50:
-            append_to_parquet(batch)
-            batch = []
-            logging.info(f"Saved {idx}/{len(all_urls)} URLs")
+        try:
+            data, driver = extract_url_data(driver, url)
+            
+            # Only append if we got actual content (not empty)
+            if data.get("h1") or data.get("h2") or data.get("content"):
+                batch.append(data)
+                successful_extractions += 1
+                logging.info(f"[{idx}/{len(all_urls)}] ✅ Extracted: {url[:80]}...")
+            else:
+                failed_extractions += 1
+                logging.warning(f"[{idx}/{len(all_urls)}] ⚠️  Empty content: {url[:80]}...")
+            
+            # Save batch incrementally to avoid data loss
+            if len(batch) >= batch_size:
+                append_to_parquet(batch)
+                logging.info(f"💾 Saved batch of {len(batch)} URLs to parquet (Total saved: {successful_extractions})")
+                batch = []
+                
+        except Exception as e:
+            failed_extractions += 1
+            logging.error(f"[{idx}/{len(all_urls)}] ❌ Failed to extract {url[:80]}...: {e}")
+        
         time.sleep(1.5)
 
+    # Save remaining batch
     if batch:
         append_to_parquet(batch)
+        logging.info(f"💾 Saved final batch of {len(batch)} URLs to parquet")
+
+    logging.info("=" * 60)
+    logging.info(f"Phase 2 Complete:")
+    logging.info(f"  ✅ Successful: {successful_extractions}")
+    logging.info(f"  ❌ Failed: {failed_extractions}")
+    logging.info(f"  📄 Total processed: {len(all_urls)}")
+    logging.info("=" * 60)
 
     try:
         driver.quit()
     except Exception:
         pass
-    logging.info("DONE. Data saved in Parquet and can resume next run.")
+    
+    logging.info("DONE. Data saved in Parquet. Next run will continue from page checkpoint.")
 
 
 if __name__ == "__main__":
