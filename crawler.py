@@ -280,11 +280,6 @@ def create_driver() -> webdriver.Chrome:
         raise
 
 
-def save_page_checkpoint(page: int) -> None:
-    with open(PAGE_CHECKPOINT, "w", encoding="utf-8") as f:
-        json.dump({"last_page": page}, f, ensure_ascii=False)
-
-
 def load_page_checkpoint() -> int:
     if not os.path.exists(PAGE_CHECKPOINT):
         return 0
