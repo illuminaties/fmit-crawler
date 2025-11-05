@@ -319,22 +319,70 @@ def load_processed_urls() -> Set[str]:
     return set()
 
 
+def save_page_checkpoint(page: int) -> None:
+    """Save checkpoint to file."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(PAGE_CHECKPOINT, "w", encoding="utf-8") as f:
+        json.dump({"last_page": page}, f, ensure_ascii=False)
+
+
+def initialize_output_files() -> None:
+    """Initialize output files at the start of crawling."""
+    # Ensure data directory exists
+    os.makedirs(DATA_DIR, exist_ok=True)
+    
+    # Initialize parquet file if it doesn't exist
+    if not os.path.exists(PARQUET_FILE):
+        empty_df = pd.DataFrame(columns=["url", "h1", "h2", "content"])
+        write_parquet_df(empty_df)
+        logging.info(f"✅ Created empty parquet file: {PARQUET_FILE}")
+    else:
+        file_size = os.path.getsize(PARQUET_FILE) / 1024 / 1024
+        df = read_parquet_df()
+        logging.info(f"✅ Parquet file exists: {PARQUET_FILE} ({len(df)} records, {file_size:.2f} MB)")
+    
+    # Initialize checkpoint file if it doesn't exist
+    if not os.path.exists(PAGE_CHECKPOINT):
+        save_page_checkpoint(0)
+        logging.info(f"✅ Created checkpoint file: {PAGE_CHECKPOINT}")
+    else:
+        last_page = load_page_checkpoint()
+        logging.info(f"✅ Checkpoint file exists: {PAGE_CHECKPOINT} (last page: {last_page})")
+
+
 def append_to_parquet(rows: List[Dict[str, str]]) -> None:
+    """Append new rows to parquet file, avoiding duplicates."""
     if not rows:
         return
+    
+    # Ensure output file exists
+    if not os.path.exists(PARQUET_FILE):
+        initialize_output_files()
+    
     new_df = pd.DataFrame(rows)
+    # Ensure all required columns exist
     for col in ["url", "h1", "h2", "content"]:
         if col not in new_df.columns:
             new_df[col] = ""
+    
+    # Read existing data
     old_df = read_parquet_df()
+    
+    # Remove duplicates based on URL
     if not old_df.empty and "url" in old_df.columns and "url" in new_df.columns:
         new_df = new_df[~new_df["url"].isin(old_df["url"])]
         if new_df.empty:
+            logging.debug("All URLs already exist in parquet file, skipping append")
             return
+        # Append new data to existing
         df = pd.concat([old_df, new_df], ignore_index=True)
     else:
+        # First time writing
         df = new_df
+    
+    # Write back to file
     write_parquet_df(df)
+    logging.debug(f"Appended {len(new_df)} new records to parquet (total: {len(df)})")
 
 
 def extract_page_links(driver: webdriver.Chrome, url: str, max_retries: int = 5) -> Tuple[List[str], webdriver.Chrome]:
@@ -428,6 +476,9 @@ def run_once() -> None:
     logging.info("=" * 60)
     logging.info("START CRAWL (GitHub Actions, Parquet)")
     logging.info("=" * 60)
+    
+    # Initialize output files first (create if they don't exist)
+    initialize_output_files()
     
     # Set maximum runtime (5.5 hours to stay under 6-hour limit)
     # But we'll process only 10 pages per run to complete faster
