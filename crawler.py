@@ -310,8 +310,43 @@ def write_parquet_df(df: pd.DataFrame) -> None:
     df.to_parquet(PARQUET_FILE, index=False)
 
 
+def rebuild_parquet_from_json() -> None:
+    """Rebuild parquet file from all existing JSON files for fast duplicate checking."""
+    all_json_files = sorted(glob.glob(OUTPUT_JSON_PATTERN))
+    if not all_json_files:
+        return
+    
+    logging.info(f"🔄 Rebuilding parquet file from {len(all_json_files)} JSON file(s)...")
+    all_records = []
+    
+    for json_file in all_json_files:
+        try:
+            with open(json_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    all_records.extend(data)
+        except Exception as e:
+            logging.warning(f"Could not read JSON file {json_file}: {e}")
+    
+    if all_records:
+        df = pd.DataFrame(all_records)
+        for col in ["url", "h1", "h2", "content"]:
+            if col not in df.columns:
+                df[col] = ""
+        df = df[["url", "h1", "h2", "content"]]
+        write_parquet_df(df)
+        logging.info(f"✅ Rebuilt parquet file with {len(df)} records from JSON files")
+
+
 def load_processed_urls() -> Set[str]:
+    """Load processed URLs from parquet file. If parquet is empty, rebuild it from JSON files."""
     df = read_parquet_df()
+    
+    # If parquet is empty or very small, try to rebuild from JSON files
+    if df.empty or len(df) < 100:
+        rebuild_parquet_from_json()
+        df = read_parquet_df()
+    
     if "url" in df.columns:
         return set(df["url"].dropna().astype(str))
     return set()
@@ -415,14 +450,28 @@ def initialize_output_files() -> None:
             pass
     logging.info(f"📊 Total JSON files: {len(all_json_files)}, Total records: {total_records}, Total size: {total_size:.2f} MB")
     
-    # Create empty parquet file if it doesn't exist (for internal use)
+    # Create or rebuild parquet file (for internal use - fast duplicate checking)
     if not os.path.exists(PARQUET_FILE):
-        empty_df = pd.DataFrame(columns=["url", "h1", "h2", "content"])
-        write_parquet_df(empty_df)
-        logging.info(f"✅ Created empty parquet file: {PARQUET_FILE}")
+        # Try to rebuild from JSON files first
+        rebuild_parquet_from_json()
+        df = read_parquet_df()
+        if df.empty:
+            # If no JSON files exist, create empty parquet
+            empty_df = pd.DataFrame(columns=["url", "h1", "h2", "content"])
+            write_parquet_df(empty_df)
+            logging.info(f"✅ Created empty parquet file: {PARQUET_FILE}")
+        else:
+            file_size = os.path.getsize(PARQUET_FILE) / 1024 / 1024
+            logging.info(f"✅ Rebuilt parquet file: {PARQUET_FILE} ({len(df)} records, {file_size:.2f} MB)")
     else:
         file_size = os.path.getsize(PARQUET_FILE) / 1024 / 1024
         df = read_parquet_df()
+        # If parquet seems too small compared to JSON files, rebuild it
+        if len(df) < total_records * 0.9:  # If parquet has <90% of JSON records, rebuild
+            logging.info(f"⚠️  Parquet file seems incomplete ({len(df)} vs {total_records} JSON records), rebuilding...")
+            rebuild_parquet_from_json()
+            df = read_parquet_df()
+            file_size = os.path.getsize(PARQUET_FILE) / 1024 / 1024
         logging.info(f"✅ Parquet file exists: {PARQUET_FILE} ({len(df)} records, {file_size:.2f} MB)")
     
     # Initialize checkpoint file if it doesn't exist
