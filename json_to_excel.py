@@ -5,35 +5,52 @@ Usage: python json_to_excel.py
 """
 import json
 import os
+import glob
 import pandas as pd
 
-JSON_FILE = "data/fmit_data.json"
+JSON_PATTERN = "data/fmit_data_*.json"
 EXCEL_FILE = "data/fmit_data.xlsx"
 
 def convert_json_to_excel():
-    """Convert JSON file to Excel format."""
-    if not os.path.exists(JSON_FILE):
-        print(f"❌ JSON file not found: {JSON_FILE}")
+    """Convert all numbered JSON files to a single Excel file."""
+    # Find all JSON files matching the pattern
+    json_files = sorted(glob.glob(JSON_PATTERN))
+    
+    if not json_files:
+        print(f"❌ No JSON files found matching pattern: {JSON_PATTERN}")
+        print("💡 Make sure the crawler has run and created data files.")
         return
     
-    print(f"📖 Reading JSON file: {JSON_FILE}")
+    print(f"📖 Found {len(json_files)} JSON file(s)")
+    
+    all_data = []
+    total_size = 0
+    
+    for json_file in json_files:
+        try:
+            print(f"   Reading {os.path.basename(json_file)}...")
+            with open(json_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            if isinstance(data, list):
+                all_data.extend(data)
+                file_size = os.path.getsize(json_file) / 1024 / 1024
+                total_size += file_size
+                print(f"      ✅ {len(data)} records ({file_size:.2f} MB)")
+            else:
+                print(f"      ⚠️  Skipped (not an array)")
+        except Exception as e:
+            print(f"      ❌ Error reading {json_file}: {e}")
+    
+    if len(all_data) == 0:
+        print("⚠️  No data found in JSON files.")
+        return
+    
+    print(f"\n✅ Total records: {len(all_data)} (from {len(json_files)} file(s), {total_size:.2f} MB)")
     
     try:
-        with open(JSON_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        
-        if not isinstance(data, list):
-            print(f"❌ JSON file is not an array. Current format: {type(data)}")
-            return
-        
-        if len(data) == 0:
-            print("⚠️  JSON file is empty. No data to convert.")
-            return
-        
-        print(f"✅ Found {len(data)} records in JSON file")
-        
         # Convert to DataFrame
-        df = pd.DataFrame(data)
+        df = pd.DataFrame(all_data)
         
         # Ensure columns exist
         for col in ["url", "h1", "h2", "content"]:
@@ -44,7 +61,7 @@ def convert_json_to_excel():
         df = df[["url", "h1", "h2", "content"]]
         
         # Convert to Excel
-        print(f"💾 Converting to Excel: {EXCEL_FILE}")
+        print(f"\n💾 Converting to Excel: {EXCEL_FILE}")
         df.to_excel(EXCEL_FILE, index=False, engine='openpyxl')
         
         file_size = os.path.getsize(EXCEL_FILE) / 1024 / 1024

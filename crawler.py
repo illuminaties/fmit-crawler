@@ -25,7 +25,9 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 PARQUET_FILE = os.path.join(DATA_DIR, "fmit_data.parquet")
 PAGE_CHECKPOINT = os.path.join(DATA_DIR, "page_checkpoint.json")
-OUTPUT_JSON_FILE = os.path.join(DATA_DIR, "fmit_data.json")  # Single JSON array file
+OUTPUT_JSON_PATTERN = os.path.join(DATA_DIR, "fmit_data_*.json")  # Pattern for multiple JSON files
+OUTPUT_JSON_PREFIX = os.path.join(DATA_DIR, "fmit_data")  # Prefix for JSON files
+MAX_JSON_FILE_SIZE_MB = 95  # Maximum file size in MB (safety margin below GitHub's 100 MB limit)
 
 BASE_URL = "https://fmit.vn/en/glossary"
 MAX_PAGES = 6729
@@ -315,6 +317,57 @@ def load_processed_urls() -> Set[str]:
     return set()
 
 
+def get_current_json_file() -> str:
+    """Get the current JSON file to write to. Returns the latest file or creates a new one."""
+    # Find all existing JSON files matching the pattern
+    existing_files = sorted(glob.glob(OUTPUT_JSON_PATTERN))
+    
+    # If no files exist, create the first one
+    if not existing_files:
+        return os.path.join(DATA_DIR, "fmit_data_001.json")
+    
+    # Get the latest file
+    latest_file = existing_files[-1]
+    
+    # Check if the latest file is approaching the size limit
+    file_size_mb = os.path.getsize(latest_file) / 1024 / 1024
+    if file_size_mb >= MAX_JSON_FILE_SIZE_MB:
+        # Create a new file with incremented number
+        # Extract number from latest file (e.g., "fmit_data_001.json" -> 1)
+        latest_basename = os.path.basename(latest_file)
+        match = re.search(r'_(\d+)\.json$', latest_basename)
+        if match:
+            next_num = int(match.group(1)) + 1
+        else:
+            next_num = len(existing_files) + 1
+        return os.path.join(DATA_DIR, f"fmit_data_{next_num:03d}.json")
+    
+    return latest_file
+
+
+def migrate_old_json_file() -> None:
+    """Migrate old single fmit_data.json to new numbered format if it exists."""
+    old_file = os.path.join(DATA_DIR, "fmit_data.json")
+    if os.path.exists(old_file):
+        logging.info(f"🔄 Migrating old JSON file to new format...")
+        try:
+            with open(old_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            if isinstance(data, list) and len(data) > 0:
+                # Save to first numbered file
+                new_file = os.path.join(DATA_DIR, "fmit_data_001.json")
+                with open(new_file, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                logging.info(f"✅ Migrated {len(data)} records to {new_file}")
+                
+                # Remove old file
+                os.remove(old_file)
+                logging.info(f"✅ Removed old file: {old_file}")
+        except Exception as e:
+            logging.warning(f"Could not migrate old JSON file: {e}")
+
+
 def save_page_checkpoint(page: int) -> None:
     """Save checkpoint to file."""
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -327,21 +380,40 @@ def initialize_output_files() -> None:
     # Ensure data directory exists
     os.makedirs(DATA_DIR, exist_ok=True)
     
-    # Create empty JSON file (array format) if it doesn't exist
-    if not os.path.exists(OUTPUT_JSON_FILE):
-        with open(OUTPUT_JSON_FILE, "w", encoding="utf-8") as f:
+    # Migrate old single JSON file to new format if it exists
+    migrate_old_json_file()
+    
+    # Get or create current JSON file
+    current_json_file = get_current_json_file()
+    if not os.path.exists(current_json_file):
+        with open(current_json_file, "w", encoding="utf-8") as f:
             json.dump([], f, ensure_ascii=False, indent=2)
-        logging.info(f"✅ Created empty JSON file: {OUTPUT_JSON_FILE}")
+        logging.info(f"✅ Created new JSON file: {current_json_file}")
     else:
-        # Count records in JSON file
+        # Count records in current JSON file
         try:
-            with open(OUTPUT_JSON_FILE, "r", encoding="utf-8") as f:
+            with open(current_json_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 record_count = len(data) if isinstance(data, list) else 0
         except:
             record_count = 0
-        file_size = os.path.getsize(OUTPUT_JSON_FILE) / 1024 / 1024
-        logging.info(f"✅ JSON file exists: {OUTPUT_JSON_FILE} ({record_count} records, {file_size:.2f} MB)")
+        file_size = os.path.getsize(current_json_file) / 1024 / 1024
+        logging.info(f"✅ Current JSON file: {current_json_file} ({record_count} records, {file_size:.2f} MB)")
+    
+    # Count all JSON files
+    all_json_files = sorted(glob.glob(OUTPUT_JSON_PATTERN))
+    total_records = 0
+    total_size = 0
+    for json_file in all_json_files:
+        try:
+            with open(json_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    total_records += len(data)
+            total_size += os.path.getsize(json_file) / 1024 / 1024
+        except:
+            pass
+    logging.info(f"📊 Total JSON files: {len(all_json_files)}, Total records: {total_records}, Total size: {total_size:.2f} MB")
     
     # Create empty parquet file if it doesn't exist (for internal use)
     if not os.path.exists(PARQUET_FILE):
@@ -368,29 +440,25 @@ def append_to_files(rows: List[Dict[str, str]]) -> None:
         return
     
     # Ensure output files exist
-    if not os.path.exists(OUTPUT_JSON_FILE):
+    all_json_files = sorted(glob.glob(OUTPUT_JSON_PATTERN))
+    if not all_json_files:
         initialize_output_files()
     
-    # Read existing JSON data
-    existing_data = []
+    # Load all existing URLs from all JSON files for duplicate checking
     existing_urls = set()
-    if os.path.exists(OUTPUT_JSON_FILE):
+    for json_file in all_json_files:
         try:
-            with open(OUTPUT_JSON_FILE, "r", encoding="utf-8") as f:
-                existing_data = json.load(f)
-                if isinstance(existing_data, list):
-                    existing_urls = {item.get("url") for item in existing_data if item.get("url")}
-                else:
-                    existing_data = []
+            with open(json_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    existing_urls.update({item.get("url") for item in data if item.get("url")})
         except Exception as e:
-            logging.warning(f"Could not read existing JSON file: {e}")
-            existing_data = []
+            logging.warning(f"Could not read JSON file {json_file}: {e}")
     
-    # Filter out duplicates and add new rows
+    # Filter out duplicates and prepare new rows
     new_rows = []
     for row in rows:
         if row.get("url") and row["url"] not in existing_urls:
-            # Ensure all required fields exist
             record = {
                 "url": row.get("url", ""),
                 "h1": row.get("h1", ""),
@@ -401,17 +469,50 @@ def append_to_files(rows: List[Dict[str, str]]) -> None:
             existing_urls.add(record["url"])
     
     if not new_rows:
-        logging.debug("All URLs already exist in JSON file, skipping append")
+        logging.debug("All URLs already exist in JSON files, skipping append")
         return
     
-    # Append new rows to existing data
-    updated_data = existing_data + new_rows
+    # Get current JSON file (may create a new one if current is too large)
+    current_json_file = get_current_json_file()
     
-    # Write back to JSON file
-    with open(OUTPUT_JSON_FILE, "w", encoding="utf-8") as f:
+    # Read current file data
+    existing_data = []
+    if os.path.exists(current_json_file):
+        try:
+            with open(current_json_file, "r", encoding="utf-8") as f:
+                existing_data = json.load(f)
+                if not isinstance(existing_data, list):
+                    existing_data = []
+        except Exception as e:
+            logging.warning(f"Could not read current JSON file: {e}")
+            existing_data = []
+    
+    # Check if adding new rows would exceed the size limit
+    # Estimate size by creating a temporary merged array
+    test_data = existing_data + new_rows
+    test_json = json.dumps(test_data, ensure_ascii=False, indent=2)
+    estimated_size_mb = len(test_json.encode('utf-8')) / 1024 / 1024
+    
+    if estimated_size_mb >= MAX_JSON_FILE_SIZE_MB:
+        # Current file is full, save what we have and create a new file
+        if existing_data:
+            with open(current_json_file, "w", encoding="utf-8") as f:
+                json.dump(existing_data, f, ensure_ascii=False, indent=2)
+            file_size = os.path.getsize(current_json_file) / 1024 / 1024
+            logging.info(f"💾 Saved {len(existing_data)} records to {current_json_file} ({file_size:.2f} MB)")
+        
+        # Create new file for remaining rows
+        current_json_file = get_current_json_file()
+        existing_data = []
+        logging.info(f"📁 Created new JSON file: {current_json_file}")
+    
+    # Append new rows to current file
+    updated_data = existing_data + new_rows
+    with open(current_json_file, "w", encoding="utf-8") as f:
         json.dump(updated_data, f, ensure_ascii=False, indent=2)
     
-    logging.info(f"💾 Appended {len(new_rows)} records to JSON file (total: {len(updated_data)})")
+    file_size = os.path.getsize(current_json_file) / 1024 / 1024
+    logging.info(f"💾 Appended {len(new_rows)} records to {current_json_file} (total in file: {len(updated_data)}, size: {file_size:.2f} MB)")
     
     # Also update parquet for internal use (fast duplicate checking)
     new_df = pd.DataFrame(new_rows)

@@ -25,9 +25,10 @@ test_*.py
 test_screenshot.png
 test_page_source.html
 
-# Data files - keep JSON but ignore parquet (internal use only)
+# Data files - keep numbered JSON files but ignore parquet (internal use only)
 data/*.parquet
-# data/fmit_data.json  # Keep JSON file in repo
+data/fmit_data.json  # Ignore old single file (will be migrated)
+# data/fmit_data_*.json  # Keep numbered JSON files in repo
 # data/page_checkpoint.json  # Keep checkpoint in repo
 
 # Logs
