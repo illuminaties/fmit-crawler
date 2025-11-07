@@ -57,25 +57,46 @@ jobs:
                 echo "Push failed, attempt $i. Fetching and merging..."
                 git fetch origin
                 CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-                # Try merge - if it fails due to conflicts, skip this commit
-                # The data is safe locally and will be picked up in next run
+                # Try merge - if it fails due to conflicts, resolve JSON conflicts automatically
                 if git merge origin/$CURRENT_BRANCH -m "Merge remote changes" --no-edit; then
                   echo "Merge successful, retrying push..."
                 else
-                  echo "Merge conflict detected. Aborting merge and skipping this commit..."
-                  git merge --abort || true
-                  git reset --hard HEAD~1 || true
-                  echo "⚠️  Skipped commit due to merge conflict. Data is safe locally."
-                  echo "✅ Next workflow run will pick up the changes and retry."
-                  exit 0  # Exit successfully so workflow continues
+                  echo "Merge conflict detected. Resolving JSON conflicts..."
+                  # Find conflicted JSON files and merge them
+                  CONFLICTED_FILES=$(git diff --name-only --diff-filter=U | grep '\.json$' || true)
+                  if [ -n "$CONFLICTED_FILES" ]; then
+                    for file in $CONFLICTED_FILES; do
+                      echo "Merging conflicted JSON file: $file"
+                      # Use git checkout to get all versions
+                      git checkout --ours "$file" && mv "$file" "${file}.ours" || true
+                      git checkout --theirs "$file" && mv "$file" "${file}.theirs" || true
+                      git checkout --base "$file" && mv "$file" "${file}.base" || true
+                      # Merge using Python script
+                      python3 merge_json.py "${file}.ours" "${file}.theirs" "${file}.base" "$file" || {
+                        echo "Failed to merge $file, using ours version"
+                        mv "${file}.ours" "$file" || true
+                      }
+                      rm -f "${file}.ours" "${file}.theirs" "${file}.base" || true
+                      git add "$file"
+                    done
+                    # Continue merge
+                    git commit --no-edit || git merge --abort
+                    echo "✅ Resolved JSON conflicts, retrying push..."
+                  else
+                    echo "⚠️  Non-JSON conflicts detected. Aborting merge and skipping commit..."
+                    git merge --abort || true
+                    git reset --hard HEAD~1 || true
+                    echo "⚠️  Skipped commit due to non-JSON merge conflict."
+                    exit 0
+                  fi
                 fi
               fi
               if [ "$i" = "3" ]; then
-                echo "Push failed after 3 retries. Aborting merge and skipping commit..."
+                echo "Push failed after 3 retries. Aborting merge..."
                 git merge --abort || true
                 git reset --hard HEAD~1 || true
-                echo "⚠️  Skipped commit after max retries. Next run will retry."
-                exit 0  # Exit successfully so workflow continues
+                echo "⚠️  Skipped commit after max retries."
+                exit 0
               fi
             done
           else
