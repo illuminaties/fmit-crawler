@@ -811,7 +811,9 @@ def run_once() -> None:
     current_page += 1
     
     # Use click navigation for subsequent pages to avoid Cloudflare
-    failed_pages = []
+    browser_restart_count = 0
+    max_browser_restarts = 3
+    
     while current_page <= target_page and current_page <= MAX_PAGES:
         # Safety check: don't exceed 5.5 hours
         elapsed_time = time.time() - start_time
@@ -820,8 +822,10 @@ def run_once() -> None:
             break
         
         # Click next page button instead of direct navigation
-        if not click_next_page(driver):
-            logging.warning(f"Could not click next page button, falling back to direct navigation for page {current_page}")
+        clicked_successfully = click_next_page(driver)
+        
+        if not clicked_successfully:
+            logging.warning(f"Could not click next page button, navigating directly to page {current_page}")
             url = f"{BASE_URL}?page={current_page}"
             hrefs, driver = extract_page_links(driver, url, use_click=False)
         else:
@@ -831,22 +835,56 @@ def run_once() -> None:
             # Extract links from current page (already navigated via click)
             hrefs, driver = extract_page_links(driver, "", use_click=True)
         
-        # If extraction failed (empty results), mark page and skip
-        if not hrefs and current_page not in failed_pages:
-            logging.warning(f"⚠️  Page {current_page} returned no links - likely Cloudflare blocked. Skipping...")
-            failed_pages.append(current_page)
-            # Save checkpoint and continue to next page
-            save_page_checkpoint(current_page)
-            current_page += 1
-            pages_processed += 1
-            total_pages_processed += 1
-            time.sleep(5)  # Longer delay before next attempt
-            continue
+        # If extraction failed (empty results), restart browser and retry
+        if not hrefs:
+            if browser_restart_count < max_browser_restarts:
+                logging.warning(f"⚠️  Page {current_page} returned no links - likely Cloudflare blocked. Restarting browser (attempt {browser_restart_count + 1}/{max_browser_restarts})...")
+                
+                # Close current browser
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                
+                # Wait before creating new session
+                wait_time = 10 + (browser_restart_count * 5)  # Increasing wait time
+                logging.info(f"⏳ Waiting {wait_time}s before creating new browser session...")
+                time.sleep(wait_time)
+                
+                # Create fresh browser instance
+                logging.info("🔄 Creating new browser instance...")
+                driver = create_driver()
+                browser_restart_count += 1
+                
+                # Navigate directly to current page with fresh browser
+                url = f"{BASE_URL}?page={current_page}"
+                logging.info(f"🔗 Navigating to {url} with fresh browser...")
+                hrefs, driver = extract_page_links(driver, url, use_click=False)
+                
+                # If still no results after restart, log error but continue
+                if not hrefs:
+                    logging.error(f"❌ Page {current_page} still failed after browser restart. Continuing to next page...")
+                    # Don't save checkpoint yet - will retry this page in next run
+                    current_page += 1
+                    time.sleep(5)
+                    continue
+                else:
+                    logging.info(f"✅ Successfully extracted {len(hrefs)} links after browser restart")
+                    browser_restart_count = 0  # Reset counter on success
+            else:
+                logging.error(f"❌ Max browser restarts ({max_browser_restarts}) reached for page {current_page}. Continuing to next page...")
+                current_page += 1
+                browser_restart_count = 0
+                time.sleep(5)
+                continue
+        else:
+            # Reset restart counter on successful extraction
+            browser_restart_count = 0
         
         new_hrefs = [h for h in hrefs if h not in processed and h not in batch_urls]
         batch_urls.update(new_hrefs)
         
-        # Always save checkpoint after processing a page
+        # Always save checkpoint after successfully processing a page
         save_page_checkpoint(current_page)
         pages_processed += 1
         total_pages_processed += 1
@@ -855,9 +893,6 @@ def run_once() -> None:
         
         current_page += 1
         time.sleep(3)  # Longer delay between pages
-    
-    if failed_pages:
-        logging.warning(f"⚠️  Skipped {len(failed_pages)} pages due to Cloudflare: {failed_pages}")
     
     logging.info(f"Phase 1 Complete: Collected {len(batch_urls)} new URLs from {pages_processed} pages")
     
