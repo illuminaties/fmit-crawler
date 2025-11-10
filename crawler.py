@@ -19,6 +19,7 @@ from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
+from selenium_stealth import stealth
 
 DATA_DIR = os.getenv("DATA_DIR", "data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -799,6 +800,7 @@ def run_once() -> None:
     current_page += 1
     
     # Use click navigation for subsequent pages to avoid Cloudflare
+    failed_pages = []
     while current_page <= target_page and current_page <= MAX_PAGES:
         # Safety check: don't exceed 5.5 hours
         elapsed_time = time.time() - start_time
@@ -813,8 +815,22 @@ def run_once() -> None:
             hrefs, driver = extract_page_links(driver, url, use_click=False)
         else:
             logging.info(f"✅ Clicked to page {current_page}")
+            # Add more human-like delay after click
+            time.sleep(4)
             # Extract links from current page (already navigated via click)
             hrefs, driver = extract_page_links(driver, "", use_click=True)
+        
+        # If extraction failed (empty results), mark page and skip
+        if not hrefs and current_page not in failed_pages:
+            logging.warning(f"⚠️  Page {current_page} returned no links - likely Cloudflare blocked. Skipping...")
+            failed_pages.append(current_page)
+            # Save checkpoint and continue to next page
+            save_page_checkpoint(current_page)
+            current_page += 1
+            pages_processed += 1
+            total_pages_processed += 1
+            time.sleep(5)  # Longer delay before next attempt
+            continue
         
         new_hrefs = [h for h in hrefs if h not in processed and h not in batch_urls]
         batch_urls.update(new_hrefs)
@@ -827,7 +843,10 @@ def run_once() -> None:
         logging.info(f"Page {current_page}: Found {len(hrefs)} links, {len(new_hrefs)} new (batch: {len(batch_urls)})")
         
         current_page += 1
-        time.sleep(2)
+        time.sleep(3)  # Longer delay between pages
+    
+    if failed_pages:
+        logging.warning(f"⚠️  Skipped {len(failed_pages)} pages due to Cloudflare: {failed_pages}")
     
     logging.info(f"Phase 1 Complete: Collected {len(batch_urls)} new URLs from {pages_processed} pages")
     
