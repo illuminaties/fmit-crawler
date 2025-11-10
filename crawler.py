@@ -30,7 +30,16 @@ OUTPUT_JSON_PREFIX = os.path.join(DATA_DIR, "fmit_data")  # Prefix for JSON file
 MAX_JSON_FILE_SIZE_MB = 95  # Maximum file size in MB (safety margin below GitHub's 100 MB limit)
 
 BASE_URL = "https://fmit.vn/en/glossary"
-MAX_PAGES = 6729
+MAX_PAGES = 7185
+
+CLOUDFLARE_KEYWORDS = [
+    "just a moment",
+    "checking your browser",
+    "please enable cookies",
+    "attention required",
+    "verify you are human",
+    "enable javascript"
+]
 
 
 def setup_logging() -> None:
@@ -360,6 +369,37 @@ def load_processed_urls() -> Set[str]:
     return set()
 
 
+def wait_for_cloudflare_clear(driver: webdriver.Chrome, url: str, timeout: int = 45) -> bool:
+    """Detect and wait for Cloudflare challenge pages to clear."""
+    start_time = time.time()
+    already_refreshed = False
+    while time.time() - start_time < timeout:
+        try:
+            title = (driver.title or "").lower()
+        except Exception:
+            title = ""
+        try:
+            page_source = driver.page_source.lower() if driver.page_source else ""
+        except Exception:
+            page_source = ""
+        
+        if any(keyword in title or keyword in page_source for keyword in CLOUDFLARE_KEYWORDS):
+            logging.warning(f"☁️  Cloudflare challenge detected on {url}. Waiting for clearance...")
+            time.sleep(5)
+            # Refresh once if still stuck after first wait
+            if not already_refreshed:
+                try:
+                    driver.refresh()
+                    already_refreshed = True
+                except Exception:
+                    pass
+            continue
+        return True
+
+    logging.error(f"❌ Cloudflare challenge did not clear for {url} within {timeout}s")
+    return False
+
+
 def get_current_json_file() -> str:
     """Get the current JSON file to write to. Returns the latest file or creates a new one."""
     # Find all existing JSON files matching the pattern
@@ -592,13 +632,22 @@ def extract_page_links(driver: webdriver.Chrome, url: str, max_retries: int = 5)
             driver.get(url)
             
             # Wait for page to load - wait for body or document ready
-            WebDriverWait(driver, 10).until(
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            
+            # Wait for Cloudflare challenge to clear if present
+            if not wait_for_cloudflare_clear(driver, url):
+                raise TimeoutException("Cloudflare challenge did not clear in time")
+            
+            # Ensure body is still present after Cloudflare clears
+            WebDriverWait(driver, 15).until(
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
             
             # Wait for the dictionary-items element to appear (with longer timeout)
             try:
-                items = WebDriverWait(driver, 15).until(
+                items = WebDriverWait(driver, 25).until(
                     EC.presence_of_element_located((By.CLASS_NAME, "dictionary-items"))
                 )
             except TimeoutException:
@@ -645,15 +694,28 @@ def extract_page_links(driver: webdriver.Chrome, url: str, max_retries: int = 5)
 
 
 def extract_url_data(driver: webdriver.Chrome, url: str, max_retries: int = 5) -> Tuple[Dict[str, str], webdriver.Chrome]:
-    for _ in range(max_retries):
+    for attempt in range(max_retries):
         try:
             driver.get(url)
-            time.sleep(2)
+            
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            
+            if not wait_for_cloudflare_clear(driver, url):
+                raise TimeoutException("Cloudflare challenge did not clear in time")
+            
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            
             h1 = h2 = content = ""
             try:
-                h1_el = driver.find_element(By.CSS_SELECTOR, "h1.dictionary-detail-title")
+                h1_el = WebDriverWait(driver, 20).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "h1.dictionary-detail-title"))
+                )
                 h1 = h1_el.text.strip()
-            except NoSuchElementException:
+            except TimeoutException:
                 pass
             try:
                 h2_el = driver.find_element(By.CSS_SELECTOR, "h2.dictionary-detail-title")
@@ -661,13 +723,15 @@ def extract_url_data(driver: webdriver.Chrome, url: str, max_retries: int = 5) -
             except NoSuchElementException:
                 pass
             try:
-                content_el = driver.find_element(By.CSS_SELECTOR, "div.dictionary-details")
+                content_el = WebDriverWait(driver, 20).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "div.dictionary-details"))
+                )
                 content = content_el.text.strip()
-            except NoSuchElementException:
+            except TimeoutException:
                 pass
             return {"url": url, "h1": h1, "h2": h2, "content": content}, driver
         except Exception as e:
-            logging.warning(f"URL error {url}: {e}. Retry in 10s...")
+            logging.warning(f"URL error {url} (attempt {attempt + 1}/{max_retries}): {e}. Retry in 10s...")
             time.sleep(10)
     return {"url": url, "h1": "", "h2": "", "content": ""}, driver
 
@@ -772,10 +836,10 @@ def run_once() -> None:
             if data.get("h1") or data.get("h2") or data.get("content"):
                 batch.append(data)
                 successful_extractions += 1
-                logging.info(f"[{idx}/{len(batch_urls)}] ✅ Extracted: {url[:80]}...")
+                logging.info(f"[{idx}/{len(batch_urls)}] ✅ Extracted: {url}")
             else:
                 failed_extractions += 1
-                logging.warning(f"[{idx}/{len(batch_urls)}] ⚠️  Empty content: {url[:80]}...")
+                logging.warning(f"[{idx}/{len(batch_urls)}] ⚠️  Empty content: {url}")
             
             # Save batch incrementally to avoid data loss
             if len(batch) >= batch_size:
@@ -785,7 +849,7 @@ def run_once() -> None:
                 
         except Exception as e:
             failed_extractions += 1
-            logging.error(f"[{idx}/{len(batch_urls)}] ❌ Failed to extract {url[:80]}...: {e}")
+            logging.error(f"[{idx}/{len(batch_urls)}] ❌ Failed to extract {url}: {e}")
         
         time.sleep(1.5)
     
