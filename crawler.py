@@ -626,47 +626,52 @@ def append_to_files(rows: List[Dict[str, str]]) -> None:
             write_parquet_df(df)
 
 
-def extract_page_links(driver: webdriver.Chrome, url: str, max_retries: int = 5) -> Tuple[List[str], webdriver.Chrome]:
+def click_next_page(driver: webdriver.Chrome) -> bool:
+    """Click the 'Next page' button to navigate. Returns True if successful."""
+    try:
+        # Find and click the next page link
+        next_link = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, '//a[@title="Next page" or contains(text(), "›")]'))
+        )
+        next_link.click()
+        time.sleep(3)  # Wait for page transition
+        return True
+    except Exception as e:
+        logging.debug(f"Could not click next page button: {e}")
+        return False
+
+
+def extract_page_links(driver: webdriver.Chrome, url: str, use_click: bool = False, max_retries: int = 3) -> Tuple[List[str], webdriver.Chrome]:
+    """Extract links from a glossary page. If use_click=True, assumes already on page and just extracts."""
     for attempt in range(max_retries):
         try:
-            driver.get(url)
+            # Only navigate if not using click navigation
+            if not use_click:
+                driver.get(url)
+                
+                # Wait for page to load
+                WebDriverWait(driver, 15).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "body"))
+                )
+                
+                # Wait for Cloudflare challenge to clear if present
+                if not wait_for_cloudflare_clear(driver, url):
+                    raise TimeoutException("Cloudflare challenge did not clear in time")
+                
+                # Ensure body is still present after Cloudflare clears
+                WebDriverWait(driver, 15).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "body"))
+                )
             
-            # Wait for page to load - wait for body or document ready
-            WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.TAG_NAME, "body"))
-            )
-            
-            # Wait for Cloudflare challenge to clear if present
-            if not wait_for_cloudflare_clear(driver, url):
-                raise TimeoutException("Cloudflare challenge did not clear in time")
-            
-            # Ensure body is still present after Cloudflare clears
-            WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.TAG_NAME, "body"))
-            )
-            
-            # Wait for the dictionary-items element to appear (with longer timeout)
+            # Wait for the dictionary-items element to appear
             try:
-                items = WebDriverWait(driver, 25).until(
+                items = WebDriverWait(driver, 20).until(
                     EC.presence_of_element_located((By.CLASS_NAME, "dictionary-items"))
                 )
             except TimeoutException:
                 # If element not found, log page source snippet for debugging
                 page_source_preview = driver.page_source[:500] if driver.page_source else "No page source"
-                logging.warning(f"Element '.dictionary-items' not found on {url}. Page source preview: {page_source_preview}...")
-                # Try to find alternative selectors
-                alternative_selectors = [
-                    (By.CLASS_NAME, "dictionary"),
-                    (By.CSS_SELECTOR, "[class*='dictionary']"),
-                    (By.CSS_SELECTOR, "[class*='item']"),
-                ]
-                for selector_type, selector_value in alternative_selectors:
-                    try:
-                        elements = driver.find_elements(selector_type, selector_value)
-                        if elements:
-                            logging.info(f"Found {len(elements)} elements with selector {selector_type}:{selector_value}")
-                    except:
-                        pass
+                logging.warning(f"Element '.dictionary-items' not found. Page source preview: {page_source_preview}...")
                 raise
             
             links = items.find_elements(By.XPATH, './/li[@class="item"]/a[@href]')
@@ -676,20 +681,21 @@ def extract_page_links(driver: webdriver.Chrome, url: str, max_retries: int = 5)
                 if href and "fmit.vn" in href and ("/glossary/" in href or "/tu-dien-quan-ly/" in href):
                     hrefs.append(href)
             
+            current_url = driver.current_url
             if hrefs:
-                logging.info(f"Found {len(hrefs)} links on {url}")
+                logging.info(f"Found {len(hrefs)} links on {current_url}")
             else:
-                logging.warning(f"No links found in dictionary-items on {url}")
+                logging.warning(f"No links found in dictionary-items on {current_url}")
             
             return list(set(hrefs)), driver
         except TimeoutException as e:
-            logging.warning(f"Page timeout {url} (attempt {attempt + 1}/{max_retries}): {e}. Retry in 10s...")
+            logging.warning(f"Page timeout (attempt {attempt + 1}/{max_retries}): {e}. Retry in 10s...")
             time.sleep(10)
         except Exception as e:
-            logging.warning(f"Page error {url} (attempt {attempt + 1}/{max_retries}): {e}. Retry in 10s...")
+            logging.warning(f"Page error (attempt {attempt + 1}/{max_retries}): {e}. Retry in 10s...")
             time.sleep(10)
 
-    logging.error(f"Failed to extract links from {url} after {max_retries} attempts")
+    logging.error(f"Failed to extract links after {max_retries} attempts")
     return [], driver
 
 
@@ -780,15 +786,36 @@ def run_once() -> None:
     batch_urls: Set[str] = set()
     pages_processed = 0
     
+    # Navigate to the starting page once
+    start_url = BASE_URL if current_page == 1 else f"{BASE_URL}?page={current_page}"
+    logging.info(f"🔗 Navigating to starting page: {start_url}")
+    hrefs, driver = extract_page_links(driver, start_url, use_click=False)
+    new_hrefs = [h for h in hrefs if h not in processed and h not in batch_urls]
+    batch_urls.update(new_hrefs)
+    save_page_checkpoint(current_page)
+    pages_processed += 1
+    total_pages_processed += 1
+    logging.info(f"Page {current_page}: Found {len(hrefs)} links, {len(new_hrefs)} new (batch: {len(batch_urls)})")
+    current_page += 1
+    
+    # Use click navigation for subsequent pages to avoid Cloudflare
     while current_page <= target_page and current_page <= MAX_PAGES:
         # Safety check: don't exceed 5.5 hours
         elapsed_time = time.time() - start_time
         if elapsed_time > MAX_RUNTIME_SECONDS - 600:
             logging.warning("⏰ Approaching time limit, stopping URL collection")
             break
-            
-        url = BASE_URL if current_page == 1 else f"{BASE_URL}?page={current_page}"
-        hrefs, driver = extract_page_links(driver, url)
+        
+        # Click next page button instead of direct navigation
+        if not click_next_page(driver):
+            logging.warning(f"Could not click next page button, falling back to direct navigation for page {current_page}")
+            url = f"{BASE_URL}?page={current_page}"
+            hrefs, driver = extract_page_links(driver, url, use_click=False)
+        else:
+            logging.info(f"✅ Clicked to page {current_page}")
+            # Extract links from current page (already navigated via click)
+            hrefs, driver = extract_page_links(driver, "", use_click=True)
+        
         new_hrefs = [h for h in hrefs if h not in processed and h not in batch_urls]
         batch_urls.update(new_hrefs)
         
