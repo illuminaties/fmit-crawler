@@ -798,22 +798,8 @@ def run_once() -> None:
     batch_urls: Set[str] = set()
     pages_processed = 0
     
-    # Navigate to the starting page once
-    start_url = BASE_URL if current_page == 1 else f"{BASE_URL}?page={current_page}"
-    logging.info(f"🔗 Navigating to starting page: {start_url}")
-    hrefs, driver = extract_page_links(driver, start_url, use_click=False)
-    new_hrefs = [h for h in hrefs if h not in processed and h not in batch_urls]
-    batch_urls.update(new_hrefs)
-    save_page_checkpoint(current_page)
-    pages_processed += 1
-    total_pages_processed += 1
-    logging.info(f"Page {current_page}: Found {len(hrefs)} links, {len(new_hrefs)} new (batch: {len(batch_urls)})")
-    current_page += 1
-    
-    # Use click navigation for subsequent pages to avoid Cloudflare
-    browser_restart_count = 0
-    max_browser_restarts = 3
-    
+    # Use fresh browser for each page to avoid Cloudflare detection
+    # Pattern shows: clicking triggers Cloudflare, but direct navigation with fresh browser works
     while current_page <= target_page and current_page <= MAX_PAGES:
         # Safety check: don't exceed 5.5 hours
         elapsed_time = time.time() - start_time
@@ -821,65 +807,46 @@ def run_once() -> None:
             logging.warning("⏰ Approaching time limit, stopping URL collection")
             break
         
-        # Click next page button instead of direct navigation
-        clicked_successfully = click_next_page(driver)
+        # Close current browser and create fresh one for each page
+        try:
+            driver.quit()
+            logging.info(f"🔄 Closed browser for page {current_page}")
+        except Exception:
+            pass
         
-        if not clicked_successfully:
-            logging.warning(f"Could not click next page button, navigating directly to page {current_page}")
-            url = f"{BASE_URL}?page={current_page}"
-            hrefs, driver = extract_page_links(driver, url, use_click=False)
-        else:
-            logging.info(f"✅ Clicked to page {current_page}")
-            # Add more human-like delay after click
-            time.sleep(4)
-            # Extract links from current page (already navigated via click)
-            hrefs, driver = extract_page_links(driver, "", use_click=True)
+        # Small delay between browser sessions
+        time.sleep(3)
         
-        # If extraction failed (empty results), restart browser and retry
+        # Create fresh browser instance with stealth mode
+        logging.info(f"🆕 Creating fresh browser for page {current_page}...")
+        driver = create_driver()
+        
+        # Navigate directly to the page
+        url = BASE_URL if current_page == 1 else f"{BASE_URL}?page={current_page}"
+        logging.info(f"🔗 Navigating to {url}")
+        
+        # Extract links with fresh browser
+        hrefs, driver = extract_page_links(driver, url, use_click=False)
+        
+        # If extraction failed, try one more time with longer wait
         if not hrefs:
-            if browser_restart_count < max_browser_restarts:
-                logging.warning(f"⚠️  Page {current_page} returned no links - likely Cloudflare blocked. Restarting browser (attempt {browser_restart_count + 1}/{max_browser_restarts})...")
-                
-                # Close current browser
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-                
-                # Wait before creating new session
-                wait_time = 10 + (browser_restart_count * 5)  # Increasing wait time
-                logging.info(f"⏳ Waiting {wait_time}s before creating new browser session...")
-                time.sleep(wait_time)
-                
-                # Create fresh browser instance
-                logging.info("🔄 Creating new browser instance...")
-                driver = create_driver()
-                browser_restart_count += 1
-                
-                # Navigate directly to current page with fresh browser
-                url = f"{BASE_URL}?page={current_page}"
-                logging.info(f"🔗 Navigating to {url} with fresh browser...")
-                hrefs, driver = extract_page_links(driver, url, use_click=False)
-                
-                # If still no results after restart, log error but continue
-                if not hrefs:
-                    logging.error(f"❌ Page {current_page} still failed after browser restart. Continuing to next page...")
-                    # Don't save checkpoint yet - will retry this page in next run
-                    current_page += 1
-                    time.sleep(5)
-                    continue
-                else:
-                    logging.info(f"✅ Successfully extracted {len(hrefs)} links after browser restart")
-                    browser_restart_count = 0  # Reset counter on success
-            else:
-                logging.error(f"❌ Max browser restarts ({max_browser_restarts}) reached for page {current_page}. Continuing to next page...")
+            logging.warning(f"⚠️  Page {current_page} returned no links. Retrying once with fresh browser...")
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            
+            time.sleep(10)  # Longer wait
+            driver = create_driver()
+            logging.info(f"🔁 Retry: Navigating to {url}")
+            hrefs, driver = extract_page_links(driver, url, use_click=False)
+            
+            if not hrefs:
+                logging.error(f"❌ Page {current_page} failed after retry. Skipping...")
                 current_page += 1
-                browser_restart_count = 0
-                time.sleep(5)
+                pages_processed += 1
+                total_pages_processed += 1
                 continue
-        else:
-            # Reset restart counter on successful extraction
-            browser_restart_count = 0
         
         new_hrefs = [h for h in hrefs if h not in processed and h not in batch_urls]
         batch_urls.update(new_hrefs)
@@ -892,7 +859,6 @@ def run_once() -> None:
         logging.info(f"Page {current_page}: Found {len(hrefs)} links, {len(new_hrefs)} new (batch: {len(batch_urls)})")
         
         current_page += 1
-        time.sleep(3)  # Longer delay between pages
     
     logging.info(f"Phase 1 Complete: Collected {len(batch_urls)} new URLs from {pages_processed} pages")
     
