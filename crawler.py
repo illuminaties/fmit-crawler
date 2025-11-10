@@ -284,7 +284,18 @@ def create_driver() -> webdriver.Chrome:
     
     try:
         driver = webdriver.Chrome(service=service, options=chrome_options)
-        logging.info("Chrome driver created successfully")
+        
+        # Apply selenium-stealth to avoid bot detection
+        stealth(driver,
+                languages=["en-US", "en"],
+                vendor="Google Inc.",
+                platform="Linux",
+                webgl_vendor="Intel Inc.",
+                renderer="Intel Iris OpenGL Engine",
+                fix_hairline=True,
+        )
+        
+        logging.info("Chrome driver created successfully with stealth mode enabled")
         return driver
     except Exception as e:
         logging.error(f"Failed to create Chrome driver: {e}")
