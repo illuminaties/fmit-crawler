@@ -799,7 +799,6 @@ def run_once() -> None:
     pages_processed = 0
     
     # Use fresh browser for each page to avoid Cloudflare detection
-    # Pattern shows: clicking triggers Cloudflare, but direct navigation with fresh browser works
     while current_page <= target_page and current_page <= MAX_PAGES:
         # Safety check: don't exceed 5.5 hours
         elapsed_time = time.time() - start_time
@@ -851,7 +850,7 @@ def run_once() -> None:
         new_hrefs = [h for h in hrefs if h not in processed and h not in batch_urls]
         batch_urls.update(new_hrefs)
         
-        # Always save checkpoint after successfully processing a page
+        # Always save checkpoint after processing a page
         save_page_checkpoint(current_page)
         pages_processed += 1
         total_pages_processed += 1
