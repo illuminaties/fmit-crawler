@@ -885,6 +885,18 @@ def run_once() -> None:
         if elapsed_time > MAX_RUNTIME_SECONDS - 300:  # 5 min buffer
             logging.warning("⏰ Approaching time limit, stopping content extraction")
             break
+        
+        # Close current browser and create fresh one for each URL
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        
+        # Small delay between browser sessions
+        time.sleep(2)
+        
+        # Create fresh browser instance
+        driver = create_driver()
             
         try:
             data, driver = extract_url_data(driver, url)
@@ -907,8 +919,6 @@ def run_once() -> None:
         except Exception as e:
             failed_extractions += 1
             logging.error(f"[{idx}/{len(batch_urls)}] ❌ Failed to extract {url}: {e}")
-        
-        time.sleep(1.5)
     
     # Save remaining batch
     if batch:
