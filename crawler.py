@@ -31,7 +31,8 @@ OUTPUT_JSON_PREFIX = os.path.join(DATA_DIR, "fmit_data")  # Prefix for JSON file
 MAX_JSON_FILE_SIZE_MB = 95  # Maximum file size in MB (safety margin below GitHub's 100 MB limit)
 
 BASE_URL = "https://fmit.vn/en/glossary"
-MAX_PAGES = 7185
+START_PAGE = 1351  # Account 1: Pages 1351-2517
+MAX_PAGES = 2517
 
 CLOUDFLARE_KEYWORDS = [
     "just a moment",
@@ -306,12 +307,14 @@ def create_driver() -> webdriver.Chrome:
 
 def load_page_checkpoint() -> int:
     if not os.path.exists(PAGE_CHECKPOINT):
-        return 0
+        return START_PAGE - 1  # Will be incremented to START_PAGE
     try:
         with open(PAGE_CHECKPOINT, "r", encoding="utf-8") as f:
-            return int(json.load(f).get("last_page", 0))
+            last_page = int(json.load(f).get("last_page", START_PAGE - 1))
+            # If checkpoint is before our START_PAGE, start from START_PAGE
+            return max(last_page, START_PAGE - 1)
     except Exception:
-        return 0
+        return START_PAGE - 1
 
 
 def read_parquet_df() -> pd.DataFrame:
