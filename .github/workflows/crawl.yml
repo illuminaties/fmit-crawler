@@ -108,7 +108,7 @@ jobs:
         run: |
           if [ -f "data/page_checkpoint.json" ]; then
             LAST_PAGE=$(python -c "import json; f=open('data/page_checkpoint.json'); d=json.load(f); print(d.get('last_page', 0)); f.close()")
-            MAX_PAGES=6729
+            MAX_PAGES=2517
             if [ "$LAST_PAGE" -lt "$MAX_PAGES" ]; then
               echo "✅ More pages remaining ($LAST_PAGE/$MAX_PAGES). Auto-triggering next workflow run..."
               curl -X POST \
